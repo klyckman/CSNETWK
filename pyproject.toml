@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtgnp"
+version = "0.1.0"
+description = "Educational implementation of the MTGNP v1.0 two-player network protocol"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+mtgnp-server = "mtgnp.server:main"
+mtgnp-client = "mtgnp.client:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
