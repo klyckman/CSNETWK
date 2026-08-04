@@ -1,181 +1,290 @@
 # MTGNP
 
-Clean implementation of the Magic: The Gathering Multiplayer Network Protocol
-(MTGNP) v1.0 for CSNETWK.
+MTGNP is a two-player, server-authoritative implementation of the Magic: The
+Gathering Multiplayer Network Protocol v1.0 for CSNETWK. The required base
+protocol and gameplay milestones are implemented. Full coverage of every card
+effect and graphical interfaces are intentionally left as optional work.
 
-## Current milestone
+## Base milestone status
 
-This project currently implements the shared protocol/data and TCP transport
-foundation:
+| Area | Status | Evidence |
+| --- | --- | --- |
+| Protocol and framing | Complete | All 25 PDU types, four-byte big-endian frames, 65,535-byte limit, sender validation |
+| Lobby and setup | Complete | Two seats, deck validation, hidden hands, random first player, London mulligan |
+| Turn engine | Complete | Every phase/step, Draw Step, priority, Cleanup, restart |
+| Mana, spells, and Stack | Complete | Land limits, inferred mana payment, LIFO resolution, state-based actions, more than five effects |
+| Combat | Complete | Attackers, blockers, order, first strike, simultaneous damage, summoning sickness |
+| Resilience | Complete | PING/PONG, priority deadlines, concession, 30-second reconnect grace, repeat games |
+| Submission package | Locally complete | README/PDF, diagrams, AI disclosure, test matrix; LAN and cross-group checks require external participants |
 
-- validated loading of the supplied 58-card, 312-instance catalog;
-- reconciliation of the master list, instance list, and color summary;
-- legal deck validation for 1 to 50 known card-instance IDs;
-- constants for every RFC PDU, error code, lifecycle state, and turn step;
-- sender and required-field definitions for all 25 PDU types;
-- UTF-8 JSON PDU encoding, decoding, and base structural validation;
-- exact-byte TCP reads and four-byte big-endian length framing;
-- rejection of frames larger than the 65,535-byte RFC limit;
-- a thread-safe validated connection wrapper for client and server use;
-- complete, labeled PDU tracing that can be toggled at runtime;
-- standard-library unit tests for the foundation.
+The automated suite currently contains 110 tests and uses only Python's
+standard library at runtime.
 
-The project also includes its first runnable vertical slice:
+## Requirements
 
-- a TCP server on port `4444` with exactly two reusable seats;
-- immediate closure/refusal of additional connections while both seats are full;
-- a minimal client that submits `PLAYER_READY` and renders lobby state;
-- legal deck and unique player-ID enforcement;
-- per-PDU server sequence numbers and RFC `ERROR` responses;
-- `PING`/`PONG` handling;
-- `--verbose` support in both executable programs;
-- two sample legal deck files.
+- Python 3.11 or newer
+- Two terminal windows for clients and one for the server
+- TCP port 4444 reachable between the machines for a LAN game
+- No third-party runtime packages
 
-The setup/mulligan state engine now also provides:
+## Build and test
 
-- automatic transition from two ready players into `GAME_SETUP`;
-- server-side shuffling, 20 starting life, opening hands, and random first player;
-- personalized state that never reveals the opponent's hand;
-- sequence-token-validated London mulligans and bottom-card selection;
-- transition to turn 1 `UNTAP` after both players keep.
-
-The turn engine foundation additionally supports:
-
-- automatic Untap, Draw, Cleanup, active-player switching, and turn increments;
-- the first player's turn-1 draw skip;
-- priority grants, tokens, consecutive passes, and phase advancement;
-- empty-attacker combat traversal through End of Combat;
-- cleanup discard requests and graveyard movement;
-- empty-library `GAME_OVER` followed by a same-connection return to Lobby;
-- interactive decisions or unattended operation with `--auto-pass`.
-
-The resource, spell, and Stack milestone now supports:
-
-- one active-player land play during either Main Phase;
-- implicit, atomic tapping of basic lands from declared `mana_payment`;
-- visible per-player mana availability from untapped basic lands;
-- instant-speed and sorcery-speed timing checks;
-- server-authoritative `CAST_SPELL`, `STACK_PUSH`, and LIFO `STACK_RESOLVE`;
-- creatures and artifacts entering the battlefield after resolution;
-- Lightning Bolt, Unsummon, Counterspell, Giant Growth, and Doom Blade;
-- zero-toughness, lethal-damage, and `LIFE_ZERO` state-based actions;
-- interactive `pass`, `land`, and `cast` terminal commands;
-- two longer demonstration decks for manual Stack testing.
-
-The creature-combat milestone additionally supports:
-
-- atomic attacker validation, tapping, summoning sickness, haste, vigilance,
-  and defender restrictions;
-- defender-controlled blocker assignments, including multiple blockers;
-- flying and protection-based blocking restrictions;
-- attacker-selected damage order for multi-blocker combat;
-- first-strike and regular simultaneous damage steps;
-- server-broadcast `COMBAT_DAMAGE_RESULT`, creature deaths, player damage, and
-  combat-based `LIFE_ZERO` wins;
-- interactive attacker, blocker, and damage-order terminal prompts.
-
-Activated abilities, triggers, concession, enforced priority timeouts, and
-disconnect grace remain later milestones.
-
-## Run the tests
-
-From this directory in PowerShell:
+Open PowerShell in the `MTGNP` directory:
 
 ```powershell
 $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 ```
 
-The project has no third-party runtime or test dependencies.
+An editable install is optional:
 
-## Run the lobby locally
+```powershell
+python -m pip install -e .
+```
 
-Open three PowerShell terminals in this directory. Set the source path in each:
+After an editable install, `mtgnp-server` and `mtgnp-client` may be used in
+place of `python -m mtgnp.server` and `python -m mtgnp.client`.
+
+### Regenerate the submission PDF
+
+The game has no third-party runtime dependency. Rebuilding the documentation
+PDF additionally requires ReportLab:
+
+```powershell
+python -m pip install reportlab
+python scripts/build_readme_pdf.py
+```
+
+The stable output path is `output/pdf/README.pdf`. Regenerate it after filling
+in the Work Distribution Matrix or changing the README.
+
+## Run a local game
+
+Open three PowerShell terminals in this directory and set the source path in
+each terminal:
 
 ```powershell
 $env:PYTHONPATH = "src"
 ```
 
-Terminal 1:
+Start the authoritative server:
 
 ```powershell
 python -m mtgnp.server --verbose
 ```
 
-Terminal 2:
+Start player 1:
 
 ```powershell
-python -m mtgnp.client --player-id alice --deck decks/stack_demo_red_green.json --auto-keep
+python -m mtgnp.client --player-id alice --deck decks/stack_demo_red_green.json --auto-keep --verbose
 ```
 
-Terminal 3:
+Start player 2:
 
 ```powershell
-python -m mtgnp.client --player-id bob --deck decks/stack_demo_blue_black.json --auto-keep
+python -m mtgnp.client --player-id bob --deck decks/stack_demo_blue_black.json --auto-keep --verbose
 ```
 
-Each client displays its private opening hand and asks whether to keep or
-mulligan. Add `--auto-keep` to both client commands for a non-interactive setup
-smoke test. Add `--auto-pass` as well to let the turn engine run unattended.
-With the eight-card sample decks, it eventually demonstrates cleanup discard
-and `DECK_EMPTY` game over, then returns both connections to Lobby. Stop a
-program with `Ctrl+C`.
+`--verbose` is the required demo mode. It prints every complete PDU sent and
+received with direction, peer, type, sequence number, timestamp, and formatted
+JSON. Remove the flag for normal play. Add `--auto-pass` to both clients for an
+unattended protocol smoke test.
 
-## Try land play and spell casting
-
-For a longer manual game, start the clients without `--auto-pass` and use the
-Stack demo decks:
+For a LAN game, run the server on one computer, allow inbound TCP port 4444 in
+the host firewall, determine the host's LAN IPv4 address, and give both clients
+that address:
 
 ```powershell
-python -m mtgnp.client --player-id alice --deck decks/stack_demo_red_green.json --auto-keep
-python -m mtgnp.client --player-id bob --deck decks/stack_demo_blue_black.json --auto-keep
+python -m mtgnp.client --host 192.168.1.10 --player-id alice --deck decks/stack_demo_red_green.json --auto-keep --verbose
 ```
 
-When a client receives priority, it accepts these commands:
+## Terminal controls
+
+At a priority prompt the client accepts:
 
 ```text
 pass
+concede
+land CARD_ID
+cast CARD_ID [TARGET ...]
+activate SOURCE_ID ABILITY_INDEX [TARGET ...]
+```
+
+Examples:
+
+```text
 land mountain_001
-cast goblin_guide_001
 cast lightning_bolt_001 bob
 cast counterspell_001 stk_0001
 cast doom_blade_001 goblin_guide_001
+activate prodigal_sorcerer_001 0 bob
+activate millstone_001 0 bob
 ```
 
-Mana payment is inferred from the catalog. An explicit payment can be supplied
-when diagnosing protocol behavior, for example:
+Mana payment is inferred from the catalog and paid by atomically tapping legal
+sources. Diagnostic overrides are available:
 
 ```text
 cast doom_blade_001 goblin_guide_001 --mana B=1,X=1
+activate millstone_001 0 bob --mana X=2
 ```
 
-Combat decisions use guided prompts. Attacker declarations accept creature
-IDs separated by spaces or `none`. Blocker declarations use
-`BLOCKER_ID=ATTACKER_ID` pairs, for example:
+Combat prompts accept attacker IDs separated by spaces, `none`, and blocker
+pairs such as `phantasmal_bear_001=goblin_guide_001`. The attacker is prompted
+for damage order when several creatures block one attacker.
 
-```text
-phantasmal_bear_001=goblin_guide_001
+## Rules behavior that may not be obvious
+
+- The first player skips only the Draw Step of turn 1. The second player draws
+  on turn 2, and the first player begins drawing on turn 3.
+- Playing a land is not casting a spell and does not require mana. Only the
+  active player may play one land during either of that player's Main Phases.
+- Receiving priority during the opponent's turn permits responses such as
+  Instants, but it does not make the responding player the active player.
+- Lands remain tapped until their controller's next Untap Step. The terminal's
+  `Available mana` line counts currently untapped mana sources.
+- Both players must pass consecutively to resolve the top Stack item or advance
+  an empty priority window.
+
+## Disconnect and reconnect
+
+An unexpected in-game connection loss pauses the authoritative game and
+reserves that seat for 30 seconds. The server cancels the outstanding priority
+deadline while paused.
+
+To reconnect, rerun the same client command before the grace period ends. The
+`PLAYER_READY` PDU acts as the reconnect handshake and must contain the exact
+same player ID and ordered deck list. The server then:
+
+1. verifies the reserved identity and deck;
+2. sends fresh personalized authoritative state;
+3. issues a fresh priority, combat, trigger, mulligan, or discard token; and
+4. continues the original game without reshuffling or resetting it.
+
+A changed identity or deck is rejected and the reservation remains active. If
+the timer expires, the connected opponent receives `GAME_OVER` with reason
+`DISCONNECT`. The grace duration can be configured for demonstrations:
+
+```powershell
+python -m mtgnp.server --reconnect-grace 30 --verbose
 ```
 
-When several creatures block one attacker, the attacking client is prompted
-to list those blocker IDs from first damaged to last.
+## Architecture
 
-## Data ownership
+```mermaid
+flowchart LR
+    C1["Terminal client: player 1"] <-->|"Framed JSON over TCP"| S["Authoritative MTGNP server"]
+    C2["Terminal client: player 2"] <-->|"Framed JSON over TCP"| S
+    S --> P["Protocol validation and tracing"]
+    S --> L["Two-seat lobby and lifecycle"]
+    S --> G["Game, Stack, abilities, triggers, combat"]
+    G --> D["Fixed CSV card catalog"]
+```
 
-The CSV files under `data/` are local copies of the instructor-supplied
-catalog. `master_card_list.csv` defines card facts, `card_instances.csv`
-defines the legal IDs exchanged by the protocol, and `color_summary.csv` is
-used as a consistency check only.
+The clients send intent only. They never determine whether an action succeeds
+or calculate a winner. Every accepted mutation occurs in the server game
+engine, and each `GAME_STATE_UPDATE` replaces the client's local view.
 
-See `docs/FOUNDATION_DECISIONS.md` for specification interpretations that must
-remain visible to the group and be confirmed with the instructor. The framing
-and concurrency decisions are described in `docs/TRANSPORT_DESIGN.md`.
-The current state and scope boundary are described in `docs/LOBBY_DESIGN.md`.
-Setup, hidden-state, and mulligan decisions are described in
-`docs/GAME_SETUP_DESIGN.md`.
-Turn, priority-pass, and cleanup behavior are described in
-`docs/TURN_ENGINE_DESIGN.md`.
-Land, mana, spell, Stack, and effect behavior are described in
-`docs/STACK_AND_SPELLS_DESIGN.md`.
-Attacker, blocker, and combat-damage behavior is described in
-`docs/COMBAT_DESIGN.md`.
+The game lifecycle is:
+
+```mermaid
+flowchart LR
+    L["LOBBY"] --> S["GAME_SETUP"] --> M["MULLIGAN"] --> G["IN_GAME"] --> O["GAME_OVER"] --> L
+    G -. "connection lost" .-> R["RECONNECT GRACE"]
+    R -->|"same player and deck"| G
+    R -->|"30 seconds expires"| O
+```
+
+## Implemented effects
+
+The base rubric requires at least five effects. The implementation exceeds
+that gate with spell effects, activated abilities, and triggered abilities.
+
+- Spells: Lightning Bolt, Unsummon, Counterspell, Giant Growth, Doom Blade
+- Activated abilities: Prodigal Sorcerer, Royal Assassin, Millstone, Rod of Ruin
+- Triggered abilities: Goblin Guide, Monastery Swiftspear, Phantasmal Bear,
+  Gray Merchant of Asphodel, Gravedigger
+
+Dedicated demonstrations are available in `decks/ability_demo_*.json` and
+`decks/trigger_demo_*.json`.
+
+## Test coverage
+
+Automated tests cover catalog reconciliation, all PDU shapes, malformed and
+fragmented framing, hidden information, mulligans, turn transitions, draws,
+land and mana rules, Stack ordering and countering, state-based actions,
+combat, activated and triggered abilities, timeouts, heartbeat behavior,
+concession, same-connection restart, reconnect success, reconnect rejection,
+and reconnect expiry.
+
+The external checks in `docs/INTEROPERABILITY_TEST_MATRIX.md` must be completed
+on the actual demo machines. They are deliberately not marked as passed in
+advance.
+
+## Known limitations and RFC interpretations
+
+- MTGNP defines reconnect as required but defines no reconnect/session PDU.
+  This implementation reuses `PLAYER_READY` with the same player ID and exact
+  ordered deck. This is an implementation-defined extension using an existing
+  PDU rather than adding a non-standard message type.
+- Player IDs are not authenticated because MTGNP 1.0 defines no authentication.
+  The reconnect check prevents accidental seat takeover, not a malicious peer
+  that already knows the original player ID and deck.
+- A legal deck may contain fewer than seven cards. Setup draws all cards that
+  are available; a later required draw from an empty library loses the game.
+- Each physical card instance ID may occur in only one submitted deck.
+- Each physical server-to-client PDU receives a distinct monotonically
+  increasing server sequence number, including separate broadcast copies.
+- Five spell effects and selected activated/triggered abilities are supported.
+  Full behavior for every catalog card is optional bonus work and is not yet
+  implemented.
+- The required client is terminal-based. A graphical interface is optional.
+
+## Work Distribution Matrix
+
+Replace the member headings and every `Record actual contribution` cell before
+submission. Do not claim work that a member did not perform.
+
+| Task / Feature | Member 1 | Member 2 | Member 3 | Member 4 |
+| --- | --- | --- | --- | --- |
+| TCP server, connections, framing, dispatch | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| Lobby, setup, and mulligan | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| Turn and phase engine | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| Priority, Stack, spells, and abilities | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| Combat system | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| Client and state rendering | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| All 25 PDU types | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| Errors, heartbeat, timeout, and reconnect | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| Verbose PDU tracing | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| Tests and interoperability | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| README, diagrams, and disclosure | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+
+## AI Usage
+
+OpenAI Codex was used as a learning and development assistant to analyze the
+provided MTGNP specification and CSV catalog, propose milestone boundaries,
+explain MTG rules and protocol behavior, draft and revise Python implementation
+code, create automated tests, improve terminal readability, diagnose gameplay
+issues, and prepare documentation. Its output was applied to the local project
+through an iterative workflow and checked with the automated test suite.
+
+Before submission, every group member must personally review the implementation,
+run the tests, perform the manual interoperability checks, and be able to
+explain the generated or assisted code. Update this disclosure if any other AI
+tool is used.
+
+## Project documentation
+
+- `docs/FOUNDATION_DECISIONS.md` - catalog and RFC interpretation decisions
+- `docs/TRANSPORT_DESIGN.md` - TCP framing, connection wrapper, and tracing
+- `docs/LOBBY_DESIGN.md` - lobby and ready validation
+- `docs/GAME_SETUP_DESIGN.md` - setup, hidden state, and mulligans
+- `docs/TURN_ENGINE_DESIGN.md` - turns, priority, draws, and cleanup
+- `docs/STACK_AND_SPELLS_DESIGN.md` - lands, mana, spells, Stack, and effects
+- `docs/COMBAT_DESIGN.md` - combat validation and damage
+- `docs/ACTIVATED_ABILITIES_DESIGN.md` - activated-ability registry and flow
+- `docs/TRIGGERED_ABILITIES_DESIGN.md` - triggers, choices, and APNAP ordering
+- `docs/RESILIENCE_DESIGN.md` - timeout, heartbeat, concession, and reconnect
+- `docs/ARCHITECTURE_AND_DEMO.md` - component and sequence walkthrough
+- `docs/INTEROPERABILITY_TEST_MATRIX.md` - required external test record
+- `docs/SUBMISSION_CHECKLIST.md` - final packaging and demo checklist

@@ -33,6 +33,11 @@ active player's graveyard. Once the hand is seven or fewer, marked creature
 damage is cleared, state is broadcast, the turn increments, and the other
 player begins Untap.
 
-The server advertises a 60-second priority limit but does not enforce the timer
-yet. Activated abilities, triggers, concession, and disconnect grace remain
-future milestones.
+The server enforces the 60-second limit advertised in every priority grant. A
+matching action consumes that exact game's seat-and-sequence deadline; a
+rejected action receives a fresh grant and timer. Expiry ends the game with
+reason `DISCONNECT`, closes the timed-out connection, and retains the opponent.
+Four activated abilities use these priority windows. Supported triggers
+temporarily pause the next grant while target choices and APNAP ordering finish,
+then join the same Stack before priority resumes. A true reconnect grace
+extension remains future work because the RFC defines no reconnect identity PDU.

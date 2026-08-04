@@ -66,6 +66,14 @@ class LobbyTests(unittest.TestCase):
         self.assertEqual(self.lobby.ready_count, 0)
         self.assertEqual(self.lobby.connect(), "seat_1")
 
+    def test_reconnect_reservation_preserves_ready_identity(self) -> None:
+        self.lobby.submit_ready(self.seat_1, "alice", ["mountain_001"])
+        self.lobby.disconnect(self.seat_1, preserve_ready=True)
+        self.assertEqual(self.lobby.ready_count, 0)
+
+        self.assertEqual(self.lobby.connect(), "seat_1")
+        self.assertEqual(self.lobby.snapshot()["ready_players"], ["alice"])
+
     def test_new_game_reset_preserves_connections_but_requires_fresh_ready(self) -> None:
         self.lobby.submit_ready(self.seat_1, "alice", ["mountain_001"])
         self.lobby.submit_ready(self.seat_2, "bob", ["island_001"])

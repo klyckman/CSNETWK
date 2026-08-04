@@ -56,6 +56,8 @@ to their owner's graveyard. A player at zero or less life loses immediately
 with reason `LIFE_ZERO`; if both are at zero or less, the Active Player loses as
 specified by the RFC.
 
-Activated abilities, replacement effects, protection, regeneration, triggers,
-and catalog effects outside the five listed above are deliberately outside this
-milestone.
+Four activated abilities and five representative triggered abilities now reuse
+this Stack machinery as described in `ACTIVATED_ABILITIES_DESIGN.md` and
+`TRIGGERED_ABILITIES_DESIGN.md`. Replacement effects, regeneration,
+kicker-dependent triggers, and catalog spell effects outside the five listed
+above remain later work.

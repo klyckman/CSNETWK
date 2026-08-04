@@ -22,5 +22,11 @@ automatically begins `GAME_SETUP`. Shuffling, opening hands, first-player
 selection, personalized hidden state, and mulligans are described in
 `GAME_SETUP_DESIGN.md`.
 
-The server also answers `PING` with a matching `PONG`. Other recognized client
-actions receive `WRONG_PHASE` while the server is in `LOBBY`.
+The server also answers `PING` with a matching `PONG`. Terminal clients send
+these heartbeats in the background and close themselves when a matching PONG
+does not arrive. Other recognized client actions receive `WRONG_PHASE` while
+the server is in `LOBBY`.
+
+After `GAME_OVER`, retained terminal clients automatically submit fresh
+`PLAYER_READY` PDUs with the same IDs and decks. Concession, priority timeout,
+and disconnect behavior are detailed in `RESILIENCE_DESIGN.md`.

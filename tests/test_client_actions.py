@@ -7,6 +7,8 @@ from pathlib import Path
 
 from mtgnp.catalog import load_catalog
 from mtgnp.client import (
+    _choose_trigger_choice,
+    _choose_trigger_order,
     _land_action_error,
     _parse_attacker_declaration,
     _parse_blocker_declaration,
@@ -30,6 +32,10 @@ class ClientActionTests(unittest.TestCase):
 
     def test_pass_and_land_commands(self) -> None:
         self.assertEqual(_parse_priority_action("pass", self.catalog), ("pass", {}))
+        self.assertEqual(
+            _parse_priority_action("concede", self.catalog),
+            ("concede", {}),
+        )
         self.assertEqual(
             _parse_priority_action("land mountain_001", self.catalog),
             ("land", {"card_id": "mountain_001"}),
@@ -59,6 +65,28 @@ class ClientActionTests(unittest.TestCase):
             {"B": 1, "X": 1},
         )
 
+    def test_activate_builds_the_rfc_cost_payment_shape(self) -> None:
+        self.assertEqual(
+            _parse_priority_action(
+                "activate prodigal_sorcerer_001 0 bob", self.catalog
+            ),
+            (
+                "activate",
+                {
+                    "source_id": "prodigal_sorcerer_001",
+                    "ability_index": 0,
+                    "targets": ("bob",),
+                    "cost_payment": {"tap": True, "mana": {}},
+                },
+            ),
+        )
+        self.assertEqual(
+            _parse_priority_action(
+                "activate rod_of_ruin_001 0 bob --mana X=3", self.catalog
+            )[1]["cost_payment"],
+            {"tap": True, "mana": {"X": 3}},
+        )
+
     def test_invalid_command_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             _parse_priority_action("cast", self.catalog)
@@ -68,6 +96,10 @@ class ClientActionTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             _parse_priority_action("land lightning_bolt_001", self.catalog)
+        with self.assertRaises(ValueError):
+            _parse_priority_action(
+                "activate grizzly_bears_001 0 bob", self.catalog
+            )
 
     def test_land_guidance_explains_active_player_phase_and_turn_limit(self) -> None:
         state = {
@@ -148,9 +180,22 @@ class ClientActionTests(unittest.TestCase):
                 }
             )
             _render_action_submission("land", {"card_id": "swamp_001"})
+            _render_action_submission(
+                "activate",
+                {
+                    "source_id": "prodigal_sorcerer_001",
+                    "ability_index": 0,
+                    "targets": ("bob",),
+                    "cost_payment": {"tap": True, "mana": {}},
+                },
+            )
         rendered = output.getvalue()
         self.assertIn("TURN 2  |  ACTIVE PLAYER: BOB", rendered)
         self.assertIn("ACTION SUBMITTED: PLAY LAND swamp_001", rendered)
+        self.assertIn(
+            "ACTION SUBMITTED: ACTIVATE prodigal_sorcerer_001 ability 0",
+            rendered,
+        )
         self.assertIn("=" * 78, rendered)
         self.assertIn("-" * 78, rendered)
 
@@ -208,6 +253,52 @@ class ClientActionTests(unittest.TestCase):
         self.assertIn("bob: U=1 | B=1", rendered)
         self.assertIn("Stack (bottom -> top):\n    (empty)", rendered)
         self.assertIn("bob: (empty)", rendered)
+
+    def test_automatic_trigger_choices_use_first_target_and_server_order(self) -> None:
+        order_pdu = {
+            "trigger_ids": ["trg_0002", "trg_0001"],
+        }
+        self.assertEqual(
+            _choose_trigger_order(order_pdu, automatic=True),
+            ("trg_0002", "trg_0001"),
+        )
+        choice_pdu = {
+            "requires_target": True,
+            "legal_targets": ["black_knight_001", "grizzly_bears_001"],
+            "optional": False,
+        }
+        self.assertEqual(
+            _choose_trigger_choice(choice_pdu, automatic=True),
+            (True, "black_knight_001"),
+        )
+
+    def test_trigger_pdus_render_readable_prompts(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _render_pdu(
+                {
+                    "type": "TRIGGER_CHOICE",
+                    "seq_num": 10,
+                    "trigger_id": "trg_0001",
+                    "source_id": "gravedigger_001",
+                    "effect_summary": "Return a creature card.",
+                    "requires_target": True,
+                    "legal_targets": ["black_knight_001"],
+                }
+            )
+            _render_pdu(
+                {
+                    "type": "TRIGGER_ORDER",
+                    "seq_num": 11,
+                    "player_id": "alice",
+                    "trigger_ids": ["trg_0001", "trg_0002"],
+                }
+            )
+        rendered = output.getvalue()
+        self.assertIn("[TRIGGER CHOICE] trg_0001 from gravedigger_001", rendered)
+        self.assertIn("Legal targets: ['black_knight_001']", rendered)
+        self.assertIn("[TRIGGER ORDER] alice", rendered)
+        self.assertIn("first is Stack bottom", rendered)
 
 
 if __name__ == "__main__":

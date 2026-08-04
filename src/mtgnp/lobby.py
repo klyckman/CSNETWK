@@ -66,15 +66,20 @@ class Lobby:
         with self._lock:
             for seat in self._seats.values():
                 if not seat.connected:
-                    seat.reset()
+                    # A seat may retain its identity while an in-progress game
+                    # waits for that player to reconnect. Ordinary Lobby
+                    # disconnects clear the seat before it becomes available.
                     seat.connected = True
                     return seat.seat_id
         raise LobbyFull()
 
-    def disconnect(self, seat_id: str) -> None:
+    def disconnect(self, seat_id: str, *, preserve_ready: bool = False) -> None:
         with self._lock:
             seat = self._seat(seat_id)
-            seat.reset()
+            if preserve_ready:
+                seat.connected = False
+            else:
+                seat.reset()
 
     def reset_for_new_game(self) -> None:
         """Clear ready identities/decks while preserving live TCP seats."""

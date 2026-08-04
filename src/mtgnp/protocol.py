@@ -204,6 +204,7 @@ STRING_FIELDS = frozenset(
         "source",
         "controller",
         "trigger_id",
+        "chosen_target",
         "effect_summary",
         "result",
         "attacker_id",
@@ -214,7 +215,7 @@ STRING_FIELDS = frozenset(
         "message",
     }
 )
-BOOLEAN_FIELDS = frozenset({"keep", "requires_target", "accept"})
+BOOLEAN_FIELDS = frozenset({"keep", "requires_target", "accept", "optional"})
 INTEGER_FIELDS = frozenset({"seq_num", "turn", "time_limit_ms", "ability_index", "timestamp"})
 
 
@@ -280,7 +281,7 @@ def validate_pdu(
             f"{message_type.value} is missing fields: {', '.join(missing)}",
         )
 
-    _require_field_shapes(pdu, spec.required_fields)
+    _require_field_shapes(pdu, frozenset(pdu))
 
     if message_type == MessageType.ERROR:
         try:
@@ -327,4 +328,3 @@ def decode_pdu(payload: bytes, *, sender: Sender | None = None) -> dict[str, Any
         raise PDUValidationError(ErrorCode.INVALID_JSON, "A PDU must be a JSON object.")
     validate_pdu(decoded, sender=sender)
     return decoded
-

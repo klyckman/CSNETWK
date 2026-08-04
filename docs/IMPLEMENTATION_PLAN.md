@@ -11,11 +11,11 @@ combat and effects depend.
 | --- | --- | --- | --- |
 | 0. Protocol shell | Framing, PDU validation, verbose logs, catalog | Fragmented/coalesced frames pass; all 25 PDU names declared; both programs log every PDU | Implemented |
 | 1. Lifecycle | Two seats, ready/deck checks, setup, London mulligan, hidden state, restart | Two real clients reach first priority; private hands never cross | Implemented |
-| 2. Turn + stack | All non-combat phases, tokens, land/mana, LIFO, SBAs, five varied effects | Pass-only full turns and counter-stack integration tests pass | Partial |
-| 3. Combat | Attackers, blockers, damage order, first/double strike, simultaneous damage | Table-driven combat tests cover unblocked, single-blocked, multi-blocked, lethal, summoning sick | Not started |
-| 4. Abilities/effects | Activated and triggered abilities, AP/NAP trigger order, remaining catalog | Each supported card has target, cost, resolution, fizzle, and SBA tests | Not started |
-| 5. Resilience | Reconnect grace, timeout races, malformed-client isolation, repeat games | Cross-process and cross-group interoperability test matrix passes | Partial |
-| 6. Submission | Contribution evidence, AI log, limitations, diagrams, finalized README PDF | Clean-clone demo on two machines; every member completes oral walkthrough | Not started |
+| 2. Turn + stack | All non-combat phases, tokens, land/mana, LIFO, SBAs, five varied effects | Pass-only full turns and counter-stack integration tests pass | Implemented |
+| 3. Combat | Attackers, blockers, damage order, first/double strike, simultaneous damage | Table-driven combat tests cover unblocked, single-blocked, multi-blocked, lethal, summoning sick | Implemented |
+| 4. Abilities/effects | Activated and triggered abilities, AP/NAP trigger order, remaining catalog | At least five effects have target, cost, resolution, fizzle, and SBA tests | Base gate implemented; full-catalog bonus remains optional |
+| 5. Resilience | Reconnect grace, timeout races, malformed-client isolation, repeat games | Disconnect, reconnect, expiry, heartbeat, and restart integration tests pass | Implemented |
+| 6. Submission | Contribution evidence, AI log, limitations, diagrams, finalized README PDF | Clean-clone demo on two machines; every member completes oral walkthrough | Local package implemented; external/manual gates pending |
 
 ## Rubric traceability
 
@@ -70,7 +70,8 @@ instructor and then preserve in tests:
    grant. Current code requires the active player, a Main Phase, and the current
    token.
 6. **Reconnect:** reconnect is required, but no session identity or reconnect
-   handshake is defined. Agree on an extension before implementing it.
+   handshake is defined. The implementation reserves the seat for 30 seconds
+   and treats an exact repeat `PLAYER_READY` as the reconnect handshake.
 7. **Field spelling:** examples use both `summoning_sick` and
    `summoning_sickness`, and trigger examples vary between `targets` and
    `legal_targets`. Current code follows the section 10 schemas.

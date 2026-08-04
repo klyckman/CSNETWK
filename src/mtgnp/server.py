@@ -34,6 +34,8 @@ from .tracing import PDUTracer
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 4444
 DEFAULT_DATA_DIRECTORY = Path(__file__).resolve().parents[2] / "data"
+DEFAULT_PRIORITY_TIME_LIMIT_MS = 60_000
+DEFAULT_RECONNECT_GRACE_SECONDS = 30.0
 
 
 @dataclass(slots=True)
@@ -41,6 +43,15 @@ class ClientSession:
     seat_id: str
     address: tuple[str, int]
     connection: FramedConnection
+
+
+@dataclass(slots=True)
+class ReconnectReservation:
+    seat_id: str
+    player_id: str
+    deck_list: tuple[str, ...]
+    game: GameSession
+    timer: threading.Timer
 
 
 class MTGNPServer:
@@ -53,9 +64,17 @@ class MTGNPServer:
         port: int = DEFAULT_PORT,
         data_directory: str | Path = DEFAULT_DATA_DIRECTORY,
         verbose: bool = False,
+        priority_time_limit_ms: int = DEFAULT_PRIORITY_TIME_LIMIT_MS,
+        reconnect_grace_seconds: float = DEFAULT_RECONNECT_GRACE_SECONDS,
     ) -> None:
+        if priority_time_limit_ms <= 0:
+            raise ValueError("priority_time_limit_ms must be positive.")
+        if reconnect_grace_seconds <= 0:
+            raise ValueError("reconnect_grace_seconds must be positive.")
         self.host = host
         self.port = port
+        self.priority_time_limit_ms = priority_time_limit_ms
+        self.reconnect_grace_seconds = reconnect_grace_seconds
         self.catalog = load_catalog(data_directory)
         self.lobby = Lobby(self.catalog)
         self.tracer = PDUTracer(enabled=verbose)
@@ -64,6 +83,12 @@ class MTGNPServer:
         self._sequence_lock = threading.Lock()
         self._game_lock = threading.RLock()
         self._game: GameSession | None = None
+        self._trigger_resume: tuple[GameSession, str, bool] | None = None
+        self._priority_timer_lock = threading.RLock()
+        self._priority_timer: threading.Timer | None = None
+        self._priority_deadline: tuple[GameSession, str, int] | None = None
+        self._reconnect_lock = threading.RLock()
+        self._reconnect_reservations: dict[str, ReconnectReservation] = {}
         self._next_sequence = 1
         self._listener: socket.socket | None = None
         self._stop = threading.Event()
@@ -172,7 +197,7 @@ class MTGNPServer:
         except FrameTooLarge as exc:
             print(f"Closing {session.seat_id}: {exc}")
         except OSError as exc:
-            if not self._stop.is_set():
+            if not self._stop.is_set() and not session.connection.closed:
                 print(f"Connection error for {session.seat_id}: {exc}")
         finally:
             self._drop_session(session)
@@ -189,6 +214,36 @@ class MTGNPServer:
             )
             return
         game = self.game
+        reservation = self._reconnect_reservation(session.seat_id)
+        if reservation is not None:
+            if message_type == MessageType.PLAYER_READY:
+                self._handle_reconnect_ready(session, pdu, reservation)
+            else:
+                self._send_error(
+                    session,
+                    ErrorCode.ILLEGAL_ACTION,
+                    "Reconnect with PLAYER_READY before sending game actions.",
+                    pdu,
+                )
+            return
+        if game is not None and self._game_has_reconnect_reservation(game):
+            if message_type == MessageType.CONCEDE:
+                self._handle_concede(session, pdu, game)
+            else:
+                self._send_error(
+                    session,
+                    ErrorCode.ILLEGAL_ACTION,
+                    "The game is paused while the opponent reconnects.",
+                    pdu,
+                )
+            return
+        if (
+            game is not None
+            and game.lifecycle_state in {LifecycleState.MULLIGAN, LifecycleState.IN_GAME}
+            and message_type == MessageType.CONCEDE
+        ):
+            self._handle_concede(session, pdu, game)
+            return
         if game is None and message_type == MessageType.PLAYER_READY:
             self._handle_player_ready(session, pdu)
             return
@@ -200,6 +255,12 @@ class MTGNPServer:
             self._handle_mulligan_choice(session, pdu, game)
             return
         if game is not None and game.lifecycle_state == LifecycleState.IN_GAME:
+            if message_type == MessageType.TRIGGER_ORDER_RESPONSE:
+                self._handle_trigger_order_response(session, pdu, game)
+                return
+            if message_type == MessageType.TRIGGER_CHOICE_RESPONSE:
+                self._handle_trigger_choice_response(session, pdu, game)
+                return
             if message_type == MessageType.PRIORITY_PASS:
                 self._handle_priority_pass(session, pdu, game)
                 return
@@ -208,6 +269,9 @@ class MTGNPServer:
                 return
             if message_type == MessageType.CAST_SPELL:
                 self._handle_cast_spell(session, pdu, game)
+                return
+            if message_type == MessageType.ACTIVATE_ABILITY:
+                self._handle_activate_ability(session, pdu, game)
                 return
             if message_type == MessageType.DECLARE_ATTACKERS:
                 self._handle_declare_attackers(session, pdu, game)
@@ -249,6 +313,51 @@ class MTGNPServer:
             return
         self._broadcast_lobby_state()
         self._start_game_if_ready()
+
+    def _handle_reconnect_ready(
+        self,
+        session: ClientSession,
+        pdu: Mapping[str, Any],
+        reservation: ReconnectReservation,
+    ) -> None:
+        """Authenticate a reserved seat using the RFC's existing ready PDU."""
+
+        if pdu["player_id"] != reservation.player_id:
+            self._send_error(
+                session,
+                ErrorCode.DUPLICATE_ID,
+                f"This seat is reserved for player_id {reservation.player_id!r}.",
+                pdu,
+            )
+            session.connection.close()
+            return
+        if tuple(pdu["deck_list"]) != reservation.deck_list:
+            self._send_error(
+                session,
+                ErrorCode.ILLEGAL_DECK,
+                "Reconnect must use the same ordered deck list as the interrupted game.",
+                pdu,
+            )
+            session.connection.close()
+            return
+
+        with self._reconnect_lock:
+            current = self._reconnect_reservations.get(session.seat_id)
+            if current is not reservation or self.game is not reservation.game:
+                self._send_error(
+                    session,
+                    ErrorCode.WRONG_PHASE,
+                    "The reconnect grace period has already ended.",
+                    pdu,
+                )
+                session.connection.close()
+                return
+            reservation.timer.cancel()
+            del self._reconnect_reservations[session.seat_id]
+
+        print(f"Reconnected {session.seat_id} as {reservation.player_id}")
+        if not self._game_has_reconnect_reservation(reservation.game):
+            self._resume_game_after_reconnect(reservation.game)
 
     def _start_game_if_ready(self) -> None:
         with self._game_lock:
@@ -324,6 +433,40 @@ class MTGNPServer:
         except (OSError, ConnectionClosed):
             session.connection.close()
 
+    def _resume_game_after_reconnect(self, game: GameSession) -> None:
+        """Refresh visible state and reissue whichever request was interrupted."""
+
+        if self.game is not game:
+            return
+        if game.lifecycle_state == LifecycleState.MULLIGAN:
+            self._send_personalized_game_states(
+                game, record_mulligan_tokens=True
+            )
+            return
+        if game.lifecycle_state != LifecycleState.IN_GAME:
+            return
+
+        self._send_personalized_game_states(
+            game, record_mulligan_tokens=False
+        )
+        if game.has_pending_triggers():
+            for seat_id in game.players:
+                game.reset_trigger_request_for_seat(seat_id)
+            self._process_pending_triggers(game)
+            return
+        if game.priority_holder_seat_id is not None:
+            self._send_priority_grant(game, game.priority_holder_seat_id)
+            return
+        if game.current_step in {
+            TurnStep.DECLARE_ATTACKERS,
+            TurnStep.DECLARE_BLOCKERS,
+            TurnStep.ASSIGN_DAMAGE_ORDER,
+        }:
+            self._reissue_combat_request(game, game.current_step)
+            return
+        if game.current_step == TurnStep.CLEANUP:
+            self._enter_cleanup(game)
+
     def _begin_first_turn(self, game: GameSession) -> None:
         self._run_untap_and_open_upkeep(game, from_phase="MULLIGAN")
 
@@ -359,11 +502,67 @@ class MTGNPServer:
                     "type": MessageType.PRIORITY_GRANT.value,
                     "seq_num": seq_num,
                     "player_id": game.player_id_for_seat(seat_id),
-                    "time_limit_ms": 60_000,
+                    "time_limit_ms": self.priority_time_limit_ms,
                 }
             )
+            self._arm_priority_deadline(game, seat_id, seq_num)
         except (OSError, ConnectionClosed):
             session.connection.close()
+
+    def _arm_priority_deadline(
+        self, game: GameSession, seat_id: str, seq_num: int
+    ) -> None:
+        with self._priority_timer_lock:
+            if self._priority_timer is not None:
+                self._priority_timer.cancel()
+            self._priority_deadline = (game, seat_id, seq_num)
+            timer = threading.Timer(
+                self.priority_time_limit_ms / 1000,
+                self._priority_deadline_expired,
+                args=(game, seat_id, seq_num),
+            )
+            timer.daemon = True
+            self._priority_timer = timer
+            timer.start()
+
+    def _consume_priority_deadline(
+        self, game: GameSession, seat_id: str, seq_num: int
+    ) -> bool:
+        with self._priority_timer_lock:
+            if self._priority_deadline != (game, seat_id, seq_num):
+                return False
+            if self._priority_timer is not None:
+                self._priority_timer.cancel()
+            self._priority_timer = None
+            self._priority_deadline = None
+            return True
+
+    def _cancel_priority_deadline(self) -> None:
+        with self._priority_timer_lock:
+            if self._priority_timer is not None:
+                self._priority_timer.cancel()
+            self._priority_timer = None
+            self._priority_deadline = None
+
+    def _priority_deadline_expired(
+        self, game: GameSession, seat_id: str, seq_num: int
+    ) -> None:
+        with self._priority_timer_lock:
+            if self._priority_deadline != (game, seat_id, seq_num):
+                return
+            self._priority_timer = None
+            self._priority_deadline = None
+            if (
+                self.game is not game
+                or game.lifecycle_state != LifecycleState.IN_GAME
+                or game.priority_holder_seat_id != seat_id
+            ):
+                return
+            game.declare_game_over(seat_id, "DISCONNECT")
+            timed_out_session = self._session_for_seat(seat_id)
+            self._finish_game(game)
+            if timed_out_session is not None:
+                timed_out_session.connection.close()
 
     def _handle_priority_pass(
         self,
@@ -371,6 +570,9 @@ class MTGNPServer:
         pdu: Mapping[str, Any],
         game: GameSession,
     ) -> None:
+        self._consume_priority_deadline(
+            game, session.seat_id, pdu["seq_num"]
+        )
         try:
             outcome = game.process_priority_pass(
                 session.seat_id, seq_num=pdu["seq_num"]
@@ -394,6 +596,9 @@ class MTGNPServer:
         pdu: Mapping[str, Any],
         game: GameSession,
     ) -> None:
+        self._consume_priority_deadline(
+            game, session.seat_id, pdu["seq_num"]
+        )
         try:
             game.process_play_land(
                 session.seat_id,
@@ -421,6 +626,9 @@ class MTGNPServer:
         pdu: Mapping[str, Any],
         game: GameSession,
     ) -> None:
+        self._consume_priority_deadline(
+            game, session.seat_id, pdu["seq_num"]
+        )
         try:
             item = game.process_cast_spell(
                 session.seat_id,
@@ -449,7 +657,70 @@ class MTGNPServer:
         self._send_personalized_game_states(
             game, record_mulligan_tokens=False
         )
-        self._send_priority_grant(game, session.seat_id)
+        self._continue_after_triggerable_event(
+            game, resume_seat_id=session.seat_id, open_priority_window=False
+        )
+
+    def _handle_activate_ability(
+        self,
+        session: ClientSession,
+        pdu: Mapping[str, Any],
+        game: GameSession,
+    ) -> None:
+        self._consume_priority_deadline(
+            game, session.seat_id, pdu["seq_num"]
+        )
+        try:
+            item = game.process_activate_ability(
+                session.seat_id,
+                seq_num=pdu["seq_num"],
+                source_id=pdu["source_id"],
+                ability_index=pdu["ability_index"],
+                targets=pdu["targets"],
+                cost_payment=pdu["cost_payment"],
+            )
+        except GameRuleError as exc:
+            self._send_error(session, exc.code, str(exc), pdu)
+            if game.priority_holder_seat_id == session.seat_id:
+                self._send_priority_grant(game, session.seat_id)
+            return
+
+        stack_item = game.visible_stack_item(item)
+        self._broadcast_server_pdu(
+            MessageType.STACK_PUSH,
+            {
+                "stack_item_id": stack_item["stack_item_id"],
+                "item_type": stack_item["item_type"],
+                "source": stack_item["source"],
+                "targets": stack_item["targets"],
+                "controller": stack_item["controller"],
+            },
+        )
+        self._send_personalized_game_states(
+            game, record_mulligan_tokens=False
+        )
+        self._continue_after_triggerable_event(
+            game, resume_seat_id=session.seat_id, open_priority_window=False
+        )
+
+    def _handle_concede(
+        self,
+        session: ClientSession,
+        pdu: Mapping[str, Any],
+        game: GameSession,
+    ) -> None:
+        expected_player_id = game.player_id_for_seat(session.seat_id)
+        if pdu["player_id"] != expected_player_id:
+            self._send_error(
+                session,
+                ErrorCode.ILLEGAL_ACTION,
+                "CONCEDE player_id must identify the sending player.",
+                pdu,
+            )
+            return
+        self._cancel_priority_deadline()
+        game.declare_game_over(session.seat_id, "CONCEDE")
+        self._finish_game(game)
 
     def _resolve_top_stack_item(self, game: GameSession) -> None:
         resolution = game.resolve_top_stack_item()
@@ -467,7 +738,148 @@ class MTGNPServer:
         if game.lifecycle_state == LifecycleState.GAME_OVER:
             self._finish_game(game)
             return
-        self._open_priority_window(game)
+        self._continue_after_triggerable_event(
+            game,
+            resume_seat_id=game.active_seat_id,
+            open_priority_window=True,
+        )
+
+    def _continue_after_triggerable_event(
+        self,
+        game: GameSession,
+        *,
+        resume_seat_id: str,
+        open_priority_window: bool,
+    ) -> None:
+        if not game.has_pending_triggers():
+            if open_priority_window:
+                self._open_priority_window(game)
+            else:
+                self._send_priority_grant(game, resume_seat_id)
+            return
+        with self._game_lock:
+            if self._trigger_resume is None:
+                self._trigger_resume = (
+                    game,
+                    resume_seat_id,
+                    open_priority_window,
+                )
+        self._process_pending_triggers(game)
+
+    def _process_pending_triggers(self, game: GameSession) -> None:
+        if not game.trigger_choices_complete():
+            trigger = game.next_trigger_choice()
+            if trigger is None:
+                return
+            session = self._session_for_seat(trigger.controller_seat_id)
+            if session is None:
+                return
+            seq_num = self._server_sequence()
+            game.record_trigger_choice_request(
+                trigger.controller_seat_id, trigger.trigger_id, seq_num
+            )
+            try:
+                session.connection.send(
+                    {
+                        "type": MessageType.TRIGGER_CHOICE.value,
+                        "seq_num": seq_num,
+                        "trigger_id": trigger.trigger_id,
+                        "source_id": trigger.source_id,
+                        "effect_summary": trigger.spec.summary,
+                        "requires_target": trigger.spec.requires_target,
+                        "legal_targets": list(trigger.legal_targets),
+                        "optional": trigger.spec.optional,
+                    }
+                )
+            except (OSError, ConnectionClosed):
+                session.connection.close()
+            return
+
+        if not game.trigger_orders_complete():
+            request = game.next_trigger_order_request()
+            if request is None:
+                return
+            seat_id, trigger_ids = request
+            session = self._session_for_seat(seat_id)
+            if session is None:
+                return
+            seq_num = self._server_sequence()
+            game.record_trigger_order_request(seat_id, seq_num)
+            try:
+                session.connection.send(
+                    {
+                        "type": MessageType.TRIGGER_ORDER.value,
+                        "seq_num": seq_num,
+                        "player_id": game.player_id_for_seat(seat_id),
+                        "trigger_ids": list(trigger_ids),
+                    }
+                )
+            except (OSError, ConnectionClosed):
+                session.connection.close()
+            return
+
+        placed = game.place_pending_triggers()
+        for item in placed:
+            stack_item = game.visible_stack_item(item)
+            self._broadcast_server_pdu(
+                MessageType.STACK_PUSH,
+                {
+                    "stack_item_id": stack_item["stack_item_id"],
+                    "item_type": stack_item["item_type"],
+                    "source": stack_item["source"],
+                    "targets": stack_item["targets"],
+                    "controller": stack_item["controller"],
+                },
+            )
+        self._send_personalized_game_states(
+            game, record_mulligan_tokens=False
+        )
+        with self._game_lock:
+            resume = self._trigger_resume
+            self._trigger_resume = None
+        if resume is None or resume[0] is not game:
+            raise RuntimeError("Trigger processing lost its priority resume state.")
+        _, resume_seat_id, open_priority_window = resume
+        if open_priority_window:
+            self._open_priority_window(game)
+        else:
+            self._send_priority_grant(game, resume_seat_id)
+
+    def _handle_trigger_choice_response(
+        self,
+        session: ClientSession,
+        pdu: Mapping[str, Any],
+        game: GameSession,
+    ) -> None:
+        try:
+            game.process_trigger_choice_response(
+                session.seat_id,
+                seq_num=pdu["seq_num"],
+                trigger_id=pdu["trigger_id"],
+                accept=pdu["accept"],
+                chosen_target=pdu.get("chosen_target"),
+            )
+        except GameRuleError as exc:
+            self._send_error(session, exc.code, str(exc), pdu)
+            game.reset_trigger_request_for_seat(session.seat_id)
+        self._process_pending_triggers(game)
+
+    def _handle_trigger_order_response(
+        self,
+        session: ClientSession,
+        pdu: Mapping[str, Any],
+        game: GameSession,
+    ) -> None:
+        try:
+            game.process_trigger_order_response(
+                session.seat_id,
+                seq_num=pdu["seq_num"],
+                ordered_trigger_ids=pdu["ordered_trigger_ids"],
+            )
+        except GameRuleError as exc:
+            self._send_error(session, exc.code, str(exc), pdu)
+            game.reset_trigger_request_for_seat(session.seat_id)
+        self._process_pending_triggers(game)
 
     def _advance_after_priority_window(self, game: GameSession) -> None:
         previous, next_step = game.advance_after_priority_window()
@@ -547,7 +959,11 @@ class MTGNPServer:
             self._send_personalized_game_states(
                 game, record_mulligan_tokens=False
             )
-            self._open_priority_window(game)
+            self._continue_after_triggerable_event(
+                game,
+                resume_seat_id=game.active_seat_id,
+                open_priority_window=True,
+            )
             return
         self._broadcast_phase_transition(
             game,
@@ -743,6 +1159,8 @@ class MTGNPServer:
         self._finish_game(game)
 
     def _finish_game(self, game: GameSession) -> None:
+        self._cancel_priority_deadline()
+        self._cancel_reconnect_reservations(game)
         if (
             game.winner_seat_id is None
             or game.loser_seat_id is None
@@ -769,6 +1187,7 @@ class MTGNPServer:
         with self._game_lock:
             if self._game is game:
                 self._game = None
+            self._trigger_resume = None
         self.lobby.reset_for_new_game()
         self._broadcast_lobby_state()
 
@@ -839,23 +1258,118 @@ class MTGNPServer:
 
     def _drop_session(self, session: ClientSession) -> None:
         removed = False
+        disconnected_game: GameSession | None = None
         with self._sessions_lock:
             if self._sessions.get(session.seat_id) is session:
                 del self._sessions[session.seat_id]
-                self.lobby.disconnect(session.seat_id)
                 removed = True
                 with self._game_lock:
-                    self._game = None
+                    if (
+                        self._game is not None
+                        and self._game.lifecycle_state
+                        in {LifecycleState.MULLIGAN, LifecycleState.IN_GAME}
+                    ):
+                        disconnected_game = self._game
+                        self.lobby.disconnect(
+                            session.seat_id, preserve_ready=True
+                        )
+                    else:
+                        self.lobby.disconnect(session.seat_id)
+                        self._game = None
+                        self._trigger_resume = None
         session.connection.close()
         if removed:
             print(f"Disconnected {session.seat_id}")
-            if not self._stop.is_set():
+            if disconnected_game is not None and not self._stop.is_set():
+                self._begin_reconnect_grace(disconnected_game, session.seat_id)
+            elif disconnected_game is not None:
+                with self._game_lock:
+                    if self._game is disconnected_game:
+                        self._game = None
+                    self._trigger_resume = None
+            elif not self._stop.is_set():
                 self._broadcast_lobby_state()
+
+    def _begin_reconnect_grace(self, game: GameSession, seat_id: str) -> None:
+        """Pause an active game and reserve its disconnected seat."""
+
+        self._cancel_priority_deadline()
+        with self._reconnect_lock:
+            if seat_id in self._reconnect_reservations:
+                return
+            player = game.players[seat_id]
+            timer = threading.Timer(
+                self.reconnect_grace_seconds,
+                self._reconnect_grace_expired,
+                args=(game, seat_id),
+            )
+            timer.daemon = True
+            self._reconnect_reservations[seat_id] = ReconnectReservation(
+                seat_id=seat_id,
+                player_id=player.player_id,
+                deck_list=player.original_deck,
+                game=game,
+                timer=timer,
+            )
+            timer.start()
+        print(
+            f"Waiting {self.reconnect_grace_seconds:g}s for "
+            f"{player.player_id} to reconnect"
+        )
+
+    def _reconnect_grace_expired(
+        self, game: GameSession, seat_id: str
+    ) -> None:
+        with self._reconnect_lock:
+            reservation = self._reconnect_reservations.get(seat_id)
+            if reservation is None or reservation.game is not game:
+                return
+            del self._reconnect_reservations[seat_id]
+        if self.game is not game or game.lifecycle_state not in {
+            LifecycleState.MULLIGAN,
+            LifecycleState.IN_GAME,
+        }:
+            return
+
+        unauthenticated_session = self._session_for_seat(seat_id)
+        if unauthenticated_session is not None:
+            unauthenticated_session.connection.close()
+        game.declare_game_over(seat_id, "DISCONNECT")
+        self._finish_game(game)
+
+    def _reconnect_reservation(
+        self, seat_id: str
+    ) -> ReconnectReservation | None:
+        with self._reconnect_lock:
+            return self._reconnect_reservations.get(seat_id)
+
+    def _game_has_reconnect_reservation(self, game: GameSession) -> bool:
+        with self._reconnect_lock:
+            return any(
+                reservation.game is game
+                for reservation in self._reconnect_reservations.values()
+            )
+
+    def _cancel_reconnect_reservations(self, game: GameSession) -> None:
+        with self._reconnect_lock:
+            matching = [
+                seat_id
+                for seat_id, reservation in self._reconnect_reservations.items()
+                if reservation.game is game
+            ]
+            for seat_id in matching:
+                self._reconnect_reservations.pop(seat_id).timer.cancel()
 
     def stop(self) -> None:
         """Stop accepting clients and close all active connections."""
 
         self._stop.set()
+        self._cancel_priority_deadline()
+        with self._reconnect_lock:
+            reservations = list(self._reconnect_reservations.values())
+            self._reconnect_reservations.clear()
+        for reservation in reservations:
+            reservation.timer.cancel()
         listener = self._listener
         self._listener = None
         if listener is not None:
@@ -877,6 +1391,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verbose", action="store_true", help="Print every PDU sent and received."
     )
+    parser.add_argument(
+        "--reconnect-grace",
+        type=float,
+        default=DEFAULT_RECONNECT_GRACE_SECONDS,
+        metavar="SECONDS",
+        help="Seconds to reserve a disconnected in-game seat (default: 30).",
+    )
     return parser
 
 
@@ -887,6 +1408,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         port=args.port,
         data_directory=args.data,
         verbose=args.verbose,
+        reconnect_grace_seconds=args.reconnect_grace,
     )
     try:
         server.serve_forever()

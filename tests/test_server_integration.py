@@ -73,6 +73,64 @@ class ServerIntegrationTests(unittest.TestCase):
         self.clients.append(client)
         return client
 
+    def connect_kept_game(
+        self,
+        alice_deck: list[str],
+        bob_deck: list[str],
+    ) -> tuple[
+        dict[str, FramedConnection],
+        str,
+        str,
+        dict[str, object],
+    ]:
+        """Connect two players and return the first Upkeep priority grant."""
+
+        alice = self.connect_client("alice-resilience")
+        bob = self.connect_client("bob-resilience")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 2))
+        clients = {"alice": alice, "bob": bob}
+        alice.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 1,
+                "player_id": "alice",
+                "deck_list": alice_deck,
+            }
+        )
+        alice.receive()
+        bob.receive()
+        bob.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 1,
+                "player_id": "bob",
+                "deck_list": bob_deck,
+            }
+        )
+        alice.receive()
+        bob.receive()
+        setup = {"alice": alice.receive(), "bob": bob.receive()}
+        for player_id, client in clients.items():
+            client.send(
+                {
+                    "type": "MULLIGAN_CHOICE",
+                    "seq_num": setup[player_id]["seq_num"],
+                    "keep": True,
+                    "cards_to_bottom": [],
+                }
+            )
+        untap = {"alice": alice.receive(), "bob": bob.receive()}
+        active = untap["alice"]["active_player"]
+        other = "bob" if active == "alice" else "alice"
+        self.assertEqual(untap["bob"]["active_player"], active)
+        self.assertEqual(alice.receive()["type"], "GAME_STATE_UPDATE")
+        self.assertEqual(bob.receive()["type"], "GAME_STATE_UPDATE")
+        self.assertEqual(alice.receive()["to_phase"], "UPKEEP")
+        self.assertEqual(bob.receive()["to_phase"], "UPKEEP")
+        grant = clients[active].receive()
+        self.assertEqual(grant["type"], "PRIORITY_GRANT")
+        return clients, active, other, grant
+
     def test_two_player_lobby_third_refusal_errors_updates_and_ping(self) -> None:
         player_1 = self.connect_client("server-for-alice")
         player_2 = self.connect_client("server-for-bob")
@@ -187,6 +245,248 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(in_game_for_bob["state"]["lifecycle_state"], "IN_GAME")
         self.assertEqual(set(in_game_for_alice["state"]["hand"]), {"alice"})
         self.assertEqual(set(in_game_for_bob["state"]["hand"]), {"bob"})
+
+    def test_concede_rejects_spoofing_then_restarts_on_same_connections(self) -> None:
+        clients, active, other, grant = self.connect_kept_game(
+            ["mountain_001", "lightning_bolt_001"],
+            ["island_001", "counterspell_001"],
+        )
+        clients[active].send(
+            {
+                "type": "CONCEDE",
+                "seq_num": grant["seq_num"],
+                "player_id": other,
+            }
+        )
+        spoof_error = clients[active].receive()
+        self.assertEqual(spoof_error["type"], "ERROR")
+        self.assertEqual(spoof_error["code"], "ILLEGAL_ACTION")
+
+        clients[active].send(
+            {
+                "type": "CONCEDE",
+                "seq_num": grant["seq_num"],
+                "player_id": active,
+            }
+        )
+        game_over = {
+            "alice": clients["alice"].receive(),
+            "bob": clients["bob"].receive(),
+        }
+        for message in game_over.values():
+            self.assertEqual(message["type"], "GAME_OVER")
+            self.assertEqual(message["winner_id"], other)
+            self.assertEqual(message["loser_id"], active)
+            self.assertEqual(message["reason"], "CONCEDE")
+        lobby = {
+            "alice": clients["alice"].receive(),
+            "bob": clients["bob"].receive(),
+        }
+        self.assertEqual(lobby["alice"]["state"]["phase"], "LOBBY")
+        self.assertEqual(lobby["bob"]["state"]["players_ready"], 0)
+        self.assertEqual(self.server.active_connections, 2)
+
+        clients["alice"].send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 2,
+                "player_id": "alice",
+                "deck_list": ["mountain_001", "lightning_bolt_001"],
+            }
+        )
+        clients["alice"].receive()
+        clients["bob"].receive()
+        clients["bob"].send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 2,
+                "player_id": "bob",
+                "deck_list": ["island_001", "counterspell_001"],
+            }
+        )
+        clients["alice"].receive()
+        clients["bob"].receive()
+        restarted = {
+            "alice": clients["alice"].receive(),
+            "bob": clients["bob"].receive(),
+        }
+        self.assertEqual(restarted["alice"]["state"]["phase"], "MULLIGAN")
+        self.assertEqual(restarted["bob"]["state"]["phase"], "MULLIGAN")
+
+    def test_priority_timeout_declares_disconnect_and_keeps_winner_connected(
+        self,
+    ) -> None:
+        self.server.priority_time_limit_ms = 75
+        clients, active, other, grant = self.connect_kept_game(
+            ["mountain_001"],
+            ["island_001"],
+        )
+        self.assertEqual(grant["time_limit_ms"], 75)
+
+        game_over = {
+            "alice": clients["alice"].receive(),
+            "bob": clients["bob"].receive(),
+        }
+        for message in game_over.values():
+            self.assertEqual(message["type"], "GAME_OVER")
+            self.assertEqual(message["winner_id"], other)
+            self.assertEqual(message["loser_id"], active)
+            self.assertEqual(message["reason"], "DISCONNECT")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 1))
+
+        clients[other].send(
+            {"type": "PING", "seq_num": 99, "timestamp": 123456}
+        )
+        received_types: list[str] = []
+        while "PONG" not in received_types:
+            received_types.append(clients[other].receive()["type"])
+        self.assertIn("PONG", received_types)
+
+    def test_unexpected_tcp_loss_awards_game_to_connected_player(self) -> None:
+        self.server.reconnect_grace_seconds = 0.075
+        clients, active, other, _ = self.connect_kept_game(
+            ["mountain_001"],
+            ["island_001"],
+        )
+        clients[active].close()
+
+        game_over = clients[other].receive()
+        self.assertEqual(game_over["type"], "GAME_OVER")
+        self.assertEqual(game_over["winner_id"], other)
+        self.assertEqual(game_over["loser_id"], active)
+        self.assertEqual(game_over["reason"], "DISCONNECT")
+        lobby = clients[other].receive()
+        self.assertEqual(lobby["state"]["phase"], "LOBBY")
+        self.assertEqual(lobby["state"]["players_connected"], 1)
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 1))
+
+    def test_player_can_reconnect_during_game_and_resume_priority(self) -> None:
+        decks = {
+            "alice": ["mountain_001", "lightning_bolt_001"],
+            "bob": ["island_001", "counterspell_001"],
+        }
+        clients, active, other, _ = self.connect_kept_game(
+            decks["alice"], decks["bob"]
+        )
+        interrupted_game = self.server.game
+        clients[active].close()
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 1))
+        self.assertIs(self.server.game, interrupted_game)
+
+        replacement = self.connect_client(f"{active}-reconnected")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 2))
+        replacement.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 2,
+                "player_id": active,
+                "deck_list": decks[active],
+            }
+        )
+
+        replacement_state = replacement.receive()
+        remaining_state = clients[other].receive()
+        self.assertEqual(replacement_state["type"], "GAME_STATE_UPDATE")
+        self.assertEqual(remaining_state["type"], "GAME_STATE_UPDATE")
+        self.assertEqual(
+            replacement_state["state"]["lifecycle_state"], "IN_GAME"
+        )
+        self.assertIs(self.server.game, interrupted_game)
+
+        resumed_grant = replacement.receive()
+        self.assertEqual(resumed_grant["type"], "PRIORITY_GRANT")
+        self.assertEqual(resumed_grant["player_id"], active)
+        replacement.send(
+            {"type": "PRIORITY_PASS", "seq_num": resumed_grant["seq_num"]}
+        )
+        opponent_grant = clients[other].receive()
+        self.assertEqual(opponent_grant["type"], "PRIORITY_GRANT")
+        self.assertEqual(opponent_grant["player_id"], other)
+
+    def test_player_can_reconnect_during_mulligan_with_fresh_tokens(self) -> None:
+        alice_deck = ["mountain_001", "lightning_bolt_001"]
+        bob_deck = ["island_001", "counterspell_001"]
+        alice = self.connect_client("alice-before-mulligan-reconnect")
+        bob = self.connect_client("bob-mulligan-reconnect")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 2))
+
+        alice.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 1,
+                "player_id": "alice",
+                "deck_list": alice_deck,
+            }
+        )
+        alice.receive()
+        bob.receive()
+        bob.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 1,
+                "player_id": "bob",
+                "deck_list": bob_deck,
+            }
+        )
+        alice.receive()
+        bob.receive()
+        alice.receive()
+        bob.receive()
+
+        alice.close()
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 1))
+        replacement = self.connect_client("alice-after-mulligan-reconnect")
+        replacement.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 2,
+                "player_id": "alice",
+                "deck_list": alice_deck,
+            }
+        )
+
+        refreshed = {
+            "alice": replacement.receive(),
+            "bob": bob.receive(),
+        }
+        for player_id, client in {"alice": replacement, "bob": bob}.items():
+            self.assertEqual(refreshed[player_id]["state"]["phase"], "MULLIGAN")
+            client.send(
+                {
+                    "type": "MULLIGAN_CHOICE",
+                    "seq_num": refreshed[player_id]["seq_num"],
+                    "keep": True,
+                    "cards_to_bottom": [],
+                }
+            )
+        self.assertEqual(replacement.receive()["type"], "PHASE_TRANSITION")
+        self.assertEqual(bob.receive()["type"], "PHASE_TRANSITION")
+
+    def test_reconnect_rejects_changed_identity_without_ending_grace(self) -> None:
+        decks = {
+            "alice": ["mountain_001"],
+            "bob": ["island_001"],
+        }
+        clients, active, _, _ = self.connect_kept_game(
+            decks["alice"], decks["bob"]
+        )
+        clients[active].close()
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 1))
+
+        impostor = self.connect_client("impostor")
+        impostor.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 2,
+                "player_id": "not-the-original-player",
+                "deck_list": decks[active],
+            }
+        )
+        error = impostor.receive()
+        self.assertEqual(error["type"], "ERROR")
+        self.assertEqual(error["code"], "DUPLICATE_ID")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 1))
+        self.assertIsNotNone(self.server.game)
 
     def test_disconnected_seat_can_be_reused_by_a_new_connection(self) -> None:
         original = self.connect_client("original")
@@ -460,6 +760,253 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(final_states[active]["state"]["stack"], [])
         post_resolution_grant = clients[active].receive()
         self.assertEqual(post_resolution_grant["player_id"], active)
+
+    def test_activated_ability_flows_through_server_and_stack(self) -> None:
+        alice = self.connect_client("alice-ability")
+        bob = self.connect_client("bob-ability")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 2))
+        clients = {"alice": alice, "bob": bob}
+        decks = {
+            "alice": [
+                "prodigal_sorcerer_001",
+                *[f"island_{number:03d}" for number in range(1, 8)],
+            ],
+            "bob": [
+                "prodigal_sorcerer_002",
+                *[f"swamp_{number:03d}" for number in range(1, 8)],
+            ],
+        }
+
+        alice.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 1,
+                "player_id": "alice",
+                "deck_list": decks["alice"],
+            }
+        )
+        alice.receive()
+        bob.receive()
+        bob.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 1,
+                "player_id": "bob",
+                "deck_list": decks["bob"],
+            }
+        )
+        alice.receive()
+        bob.receive()
+        setup = {"alice": alice.receive(), "bob": bob.receive()}
+        for player_id, client in clients.items():
+            client.send(
+                {
+                    "type": "MULLIGAN_CHOICE",
+                    "seq_num": setup[player_id]["seq_num"],
+                    "keep": True,
+                    "cards_to_bottom": [],
+                }
+            )
+
+        def receive_broadcast(expected_type: str):
+            messages = {"alice": alice.receive(), "bob": bob.receive()}
+            for message in messages.values():
+                self.assertEqual(message["type"], expected_type)
+            return messages
+
+        untap = receive_broadcast("PHASE_TRANSITION")
+        active = untap["alice"]["active_player"]
+        other = "bob" if active == "alice" else "alice"
+        source_id = (
+            "prodigal_sorcerer_001"
+            if active == "alice"
+            else "prodigal_sorcerer_002"
+        )
+        receive_broadcast("GAME_STATE_UPDATE")
+        receive_broadcast("PHASE_TRANSITION")
+        upkeep_grant = clients[active].receive()
+
+        active_seat = next(
+            seat_id
+            for seat_id, player in self.server.game.players.items()
+            if player.player_id == active
+        )
+        active_state = self.server.game.players[active_seat]
+        if source_id in active_state.hand:
+            active_state.hand.remove(source_id)
+        else:
+            active_state.library.remove(source_id)
+        definition = self.server.catalog.definition_for_instance(source_id)
+        active_state.battlefield.append(
+            {
+                "id": source_id,
+                "tapped": False,
+                "damage": 0,
+                "power": definition.power,
+                "toughness": definition.toughness,
+                "summoning_sick": False,
+            }
+        )
+
+        clients[active].send(
+            {
+                "type": "ACTIVATE_ABILITY",
+                "seq_num": upkeep_grant["seq_num"],
+                "source_id": source_id,
+                "ability_index": 0,
+                "targets": [other],
+                "cost_payment": {"tap": True, "mana": {}},
+            }
+        )
+        pushes = receive_broadcast("STACK_PUSH")
+        stack_id = pushes[active]["stack_item_id"]
+        self.assertEqual(pushes[active]["item_type"], "ABILITY")
+        states = receive_broadcast("GAME_STATE_UPDATE")
+        source_state = next(
+            permanent
+            for permanent in states[active]["state"]["battlefield"][active]
+            if permanent["id"] == source_id
+        )
+        self.assertTrue(source_state["tapped"])
+
+        retained_grant = clients[active].receive()
+        clients[active].send(
+            {"type": "PRIORITY_PASS", "seq_num": retained_grant["seq_num"]}
+        )
+        response_grant = clients[other].receive()
+        clients[other].send(
+            {"type": "PRIORITY_PASS", "seq_num": response_grant["seq_num"]}
+        )
+        resolves = receive_broadcast("STACK_RESOLVE")
+        self.assertEqual(resolves[active]["stack_item_id"], stack_id)
+        self.assertEqual(resolves[active]["result"], "RESOLVED")
+        final_states = receive_broadcast("GAME_STATE_UPDATE")
+        self.assertEqual(final_states[active]["state"]["life_totals"][other], 19)
+        self.assertEqual(final_states[active]["state"]["stack"], [])
+        self.assertEqual(clients[active].receive()["type"], "PRIORITY_GRANT")
+
+    def test_simultaneous_triggers_request_order_then_join_the_network_stack(
+        self,
+    ) -> None:
+        alice = self.connect_client("alice-triggers")
+        bob = self.connect_client("bob-triggers")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 2))
+        clients = {"alice": alice, "bob": bob}
+        decks = {
+            "alice": [
+                "monastery_swiftspear_001",
+                "monastery_swiftspear_002",
+                "mountain_001",
+                "lightning_bolt_001",
+            ],
+            "bob": [
+                "monastery_swiftspear_003",
+                "monastery_swiftspear_004",
+                "mountain_002",
+                "lightning_bolt_002",
+            ],
+        }
+        alice.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 1,
+                "player_id": "alice",
+                "deck_list": decks["alice"],
+            }
+        )
+        alice.receive()
+        bob.receive()
+        bob.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 1,
+                "player_id": "bob",
+                "deck_list": decks["bob"],
+            }
+        )
+        alice.receive()
+        bob.receive()
+        setup = {"alice": alice.receive(), "bob": bob.receive()}
+        for player_id, client in clients.items():
+            client.send(
+                {
+                    "type": "MULLIGAN_CHOICE",
+                    "seq_num": setup[player_id]["seq_num"],
+                    "keep": True,
+                    "cards_to_bottom": [],
+                }
+            )
+
+        def receive_broadcast(expected_type: str):
+            messages = {"alice": alice.receive(), "bob": bob.receive()}
+            for message in messages.values():
+                self.assertEqual(message["type"], expected_type)
+            return messages
+
+        untap = receive_broadcast("PHASE_TRANSITION")
+        active = untap["alice"]["active_player"]
+        other = "bob" if active == "alice" else "alice"
+        active_seat = next(
+            seat_id
+            for seat_id, player in self.server.game.players.items()
+            if player.player_id == active
+        )
+        swiftspears = decks[active][:2]
+        land_id = decks[active][2]
+        bolt_id = decks[active][3]
+        active_state = self.server.game.players[active_seat]
+        for card_id in (*swiftspears, land_id):
+            active_state.hand.remove(card_id)
+            definition = self.server.catalog.definition_for_instance(card_id)
+            permanent = {"id": card_id, "tapped": False}
+            if definition.card_type == "Creature":
+                permanent.update(
+                    {
+                        "damage": 0,
+                        "power": definition.power,
+                        "toughness": definition.toughness,
+                        "summoning_sick": False,
+                    }
+                )
+            active_state.battlefield.append(permanent)
+
+        receive_broadcast("GAME_STATE_UPDATE")
+        receive_broadcast("PHASE_TRANSITION")
+        upkeep_grant = clients[active].receive()
+        clients[active].send(
+            {
+                "type": "CAST_SPELL",
+                "seq_num": upkeep_grant["seq_num"],
+                "card_id": bolt_id,
+                "targets": [other],
+                "mana_payment": {"R": 1},
+            }
+        )
+        original_push = receive_broadcast("STACK_PUSH")
+        self.assertEqual(original_push[active]["item_type"], "SPELL")
+        receive_broadcast("GAME_STATE_UPDATE")
+
+        order_request = clients[active].receive()
+        self.assertEqual(order_request["type"], "TRIGGER_ORDER")
+        self.assertEqual(len(order_request["trigger_ids"]), 2)
+        requested_order = list(reversed(order_request["trigger_ids"]))
+        clients[active].send(
+            {
+                "type": "TRIGGER_ORDER_RESPONSE",
+                "seq_num": order_request["seq_num"],
+                "ordered_trigger_ids": requested_order,
+            }
+        )
+        first_trigger_push = receive_broadcast("STACK_PUSH")
+        second_trigger_push = receive_broadcast("STACK_PUSH")
+        self.assertEqual(first_trigger_push[active]["item_type"], "TRIGGER_ABILITY")
+        self.assertEqual(second_trigger_push[active]["item_type"], "TRIGGER_ABILITY")
+        trigger_state = receive_broadcast("GAME_STATE_UPDATE")
+        self.assertEqual(
+            [item["item_type"] for item in trigger_state[active]["state"]["stack"]],
+            ["SPELL", "TRIGGER_ABILITY", "TRIGGER_ABILITY"],
+        )
+        self.assertEqual(clients[active].receive()["type"], "PRIORITY_GRANT")
 
     def test_attack_block_and_combat_damage_flow_across_both_clients(self) -> None:
         alice = self.connect_client("alice-combat")

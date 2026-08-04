@@ -10,9 +10,22 @@ from enum import StrEnum
 from collections.abc import Mapping
 from typing import Any, Sequence
 
+from .abilities import (
+    AbilityEffect,
+    AbilityTarget,
+    ActivatedAbilitySpec,
+    activated_ability,
+)
 from .catalog import CardCatalog, CardDefinition, CatalogError, MANA_COLORS
 from .lobby import ReadyPlayer
 from .protocol import ErrorCode, LifecycleState, TurnStep
+from .triggers import (
+    TRIGGERED_ABILITIES,
+    TriggerEffect,
+    TriggerEvent,
+    TriggerSpec,
+    triggered_ability,
+)
 
 
 OPENING_HAND_SIZE = 7
@@ -62,6 +75,20 @@ class StackItem:
     source_id: str
     controller_seat_id: str
     targets: tuple[str, ...]
+    ability_index: int | None = None
+    trigger_id: str | None = None
+
+
+@dataclass(slots=True)
+class PendingTrigger:
+    trigger_id: str
+    source_id: str
+    controller_seat_id: str
+    spec: TriggerSpec
+    legal_targets: tuple[str, ...] = ()
+    targets: tuple[str, ...] = ()
+    accepted: bool | None = True
+    expected_choice_sequence: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +209,10 @@ class GameSession:
         self.combat_damage_order: dict[str, list[str]] = {}
         self.stack: list[StackItem] = []
         self._next_stack_item_number = 1
+        self.pending_triggers: list[PendingTrigger] = []
+        self._next_trigger_number = 1
+        self._trigger_orders: dict[str, tuple[str, ...]] = {}
+        self._expected_trigger_order_sequences: dict[str, int] = {}
         self.land_played_this_turn = False
         self.winner_seat_id: str | None = None
         self.loser_seat_id: str | None = None
@@ -485,6 +516,73 @@ class GameSession:
             )
             self._next_stack_item_number += 1
             self.stack.append(item)
+            if definition.card_type not in {"Creature", "Artifact Creature"}:
+                self._queue_controlled_triggers(
+                    seat_id, TriggerEvent.NONCREATURE_SPELL_CAST
+                )
+            self._queue_targeted_permanent_triggers(normalized_targets)
+            self._retain_priority_after_action()
+            return item
+
+    def process_activate_ability(
+        self,
+        seat_id: str,
+        *,
+        seq_num: int,
+        source_id: str,
+        ability_index: int,
+        targets: Sequence[str],
+        cost_payment: Mapping[str, Any],
+    ) -> StackItem:
+        """Pay an activated ability's costs atomically and push it onto the Stack."""
+
+        with self._lock:
+            self._require_priority_action(seat_id, seq_num)
+            source = self._controlled_permanent(seat_id, source_id)
+            definition = self._definition(source_id)
+            ability = activated_ability(definition.base_id, ability_index)
+            if ability is None:
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_ACTION,
+                    f"{definition.name} ability {ability_index!r} is not supported.",
+                )
+            if ability.tap_cost and source.get("tapped"):
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_ACTION,
+                    f"{definition.name} is already tapped.",
+                )
+            if (
+                ability.tap_cost
+                and definition.card_type in {"Creature", "Artifact Creature"}
+                and source.get("summoning_sick")
+            ):
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_ACTION,
+                    f"{definition.name} cannot pay a tap cost while summoning sick.",
+                )
+
+            normalized_targets = self._validate_activated_ability_targets(
+                source_id, definition, ability, targets
+            )
+            mana_sources = self._validate_ability_cost_payment(
+                self._player(seat_id), definition, ability, cost_payment
+            )
+
+            for permanent in mana_sources:
+                permanent["tapped"] = True
+            if ability.tap_cost:
+                source["tapped"] = True
+            item = StackItem(
+                stack_item_id=f"stk_{self._next_stack_item_number:04d}",
+                item_type="ABILITY",
+                source_id=source_id,
+                controller_seat_id=seat_id,
+                targets=normalized_targets,
+                ability_index=ability_index,
+            )
+            self._next_stack_item_number += 1
+            self.stack.append(item)
+            self._queue_targeted_permanent_triggers(normalized_targets)
             self._retain_priority_after_action()
             return item
 
@@ -497,6 +595,227 @@ class GameSession:
                 "targets": list(item.targets),
                 "controller": self.player_id_for_seat(item.controller_seat_id),
             }
+
+    def has_pending_triggers(self) -> bool:
+        with self._lock:
+            return bool(self.pending_triggers)
+
+    def next_trigger_choice(self) -> PendingTrigger | None:
+        """Return the next trigger that needs its controller's decision."""
+
+        with self._lock:
+            return next(
+                (
+                    trigger
+                    for trigger in self.pending_triggers
+                    if trigger.accepted is None
+                    and trigger.expected_choice_sequence is None
+                ),
+                None,
+            )
+
+    def trigger_choices_complete(self) -> bool:
+        with self._lock:
+            return all(
+                trigger.accepted is not None for trigger in self.pending_triggers
+            )
+
+    def record_trigger_choice_request(
+        self, seat_id: str, trigger_id: str, seq_num: int
+    ) -> None:
+        with self._lock:
+            trigger = self._pending_trigger(trigger_id)
+            if trigger.controller_seat_id != seat_id or trigger.accepted is not None:
+                raise GameRuleError(
+                    ErrorCode.TRIGGER_CHOICE_INVALID,
+                    "The trigger choice does not belong to this player.",
+                )
+            trigger.expected_choice_sequence = seq_num
+
+    def process_trigger_choice_response(
+        self,
+        seat_id: str,
+        *,
+        seq_num: int,
+        trigger_id: str,
+        accept: bool,
+        chosen_target: str | None,
+    ) -> None:
+        """Validate one optional/targeted trigger choice without partial changes."""
+
+        with self._lock:
+            trigger = self._pending_trigger(trigger_id)
+            if trigger.controller_seat_id != seat_id:
+                raise GameRuleError(
+                    ErrorCode.TRIGGER_CHOICE_INVALID,
+                    "Only the trigger's controller may make this choice.",
+                )
+            if trigger.expected_choice_sequence != seq_num:
+                raise GameRuleError(
+                    ErrorCode.STALE_ACTION,
+                    f"Trigger-choice token mismatch. Expected "
+                    f"{trigger.expected_choice_sequence}, received {seq_num}.",
+                )
+            if not isinstance(accept, bool):
+                raise GameRuleError(
+                    ErrorCode.TRIGGER_CHOICE_INVALID,
+                    "accept must be true or false.",
+                )
+            if not accept and not trigger.spec.optional:
+                raise GameRuleError(
+                    ErrorCode.TRIGGER_CHOICE_INVALID,
+                    "This triggered ability is mandatory.",
+                )
+
+            targets: tuple[str, ...] = ()
+            if accept and trigger.spec.requires_target:
+                legal_targets = self._legal_targets_for_trigger(trigger)
+                if not isinstance(chosen_target, str) or chosen_target not in legal_targets:
+                    raise GameRuleError(
+                        ErrorCode.TRIGGER_CHOICE_INVALID,
+                        f"Choose one legal trigger target from {list(legal_targets)}.",
+                    )
+                targets = (chosen_target,)
+                trigger.legal_targets = legal_targets
+            elif chosen_target is not None:
+                raise GameRuleError(
+                    ErrorCode.TRIGGER_CHOICE_INVALID,
+                    "This triggered ability does not accept a target.",
+                )
+
+            trigger.accepted = accept
+            trigger.targets = targets
+            trigger.expected_choice_sequence = None
+
+    def next_trigger_order_request(
+        self,
+    ) -> tuple[str, tuple[str, ...]] | None:
+        """Return the next APNAP player who must order simultaneous triggers."""
+
+        with self._lock:
+            if any(trigger.accepted is None for trigger in self.pending_triggers):
+                return None
+            for seat_id in self._apnap_seats():
+                trigger_ids = tuple(
+                    trigger.trigger_id
+                    for trigger in self.pending_triggers
+                    if trigger.controller_seat_id == seat_id and trigger.accepted
+                )
+                if (
+                    len(trigger_ids) > 1
+                    and seat_id not in self._trigger_orders
+                    and seat_id not in self._expected_trigger_order_sequences
+                ):
+                    return seat_id, trigger_ids
+            return None
+
+    def trigger_orders_complete(self) -> bool:
+        with self._lock:
+            if not self.trigger_choices_complete():
+                return False
+            for seat_id in self._apnap_seats():
+                trigger_count = sum(
+                    1
+                    for trigger in self.pending_triggers
+                    if trigger.controller_seat_id == seat_id and trigger.accepted
+                )
+                if trigger_count > 1 and seat_id not in self._trigger_orders:
+                    return False
+            return True
+
+    def reset_trigger_request_for_seat(self, seat_id: str) -> None:
+        """Allow the server to issue a fresh token after an invalid response."""
+
+        with self._lock:
+            for trigger in self.pending_triggers:
+                if trigger.controller_seat_id == seat_id:
+                    trigger.expected_choice_sequence = None
+            self._expected_trigger_order_sequences.pop(seat_id, None)
+
+    def record_trigger_order_request(self, seat_id: str, seq_num: int) -> None:
+        with self._lock:
+            if seat_id in self._trigger_orders:
+                raise GameRuleError(
+                    ErrorCode.TRIGGER_ORDER_INVALID,
+                    "This player's trigger order was already submitted.",
+                )
+            self._expected_trigger_order_sequences[seat_id] = seq_num
+
+    def process_trigger_order_response(
+        self,
+        seat_id: str,
+        *,
+        seq_num: int,
+        ordered_trigger_ids: Sequence[str],
+    ) -> None:
+        """Validate that an order contains each of the player's triggers once."""
+
+        with self._lock:
+            expected_sequence = self._expected_trigger_order_sequences.get(seat_id)
+            if expected_sequence != seq_num:
+                raise GameRuleError(
+                    ErrorCode.STALE_ACTION,
+                    f"Trigger-order token mismatch. Expected {expected_sequence}, "
+                    f"received {seq_num}.",
+                )
+            submitted = tuple(ordered_trigger_ids)
+            expected_ids = tuple(
+                trigger.trigger_id
+                for trigger in self.pending_triggers
+                if trigger.controller_seat_id == seat_id and trigger.accepted
+            )
+            if (
+                any(not isinstance(trigger_id, str) for trigger_id in submitted)
+                or len(set(submitted)) != len(submitted)
+                or set(submitted) != set(expected_ids)
+            ):
+                raise GameRuleError(
+                    ErrorCode.TRIGGER_ORDER_INVALID,
+                    f"Order every trigger exactly once: {list(expected_ids)}.",
+                )
+            self._trigger_orders[seat_id] = submitted
+            del self._expected_trigger_order_sequences[seat_id]
+
+    def place_pending_triggers(self) -> tuple[StackItem, ...]:
+        """Place accepted simultaneous triggers on the Stack in APNAP order."""
+
+        with self._lock:
+            if any(trigger.accepted is None for trigger in self.pending_triggers):
+                raise GameRuleError(
+                    ErrorCode.TRIGGER_CHOICE_INVALID,
+                    "All trigger choices must finish before placing triggers.",
+                )
+            placed: list[StackItem] = []
+            for seat_id in self._apnap_seats():
+                triggers = {
+                    trigger.trigger_id: trigger
+                    for trigger in self.pending_triggers
+                    if trigger.controller_seat_id == seat_id and trigger.accepted
+                }
+                if len(triggers) > 1 and seat_id not in self._trigger_orders:
+                    raise GameRuleError(
+                        ErrorCode.TRIGGER_ORDER_INVALID,
+                        "Simultaneous triggers must be ordered before placement.",
+                    )
+                order = self._trigger_orders.get(seat_id, tuple(triggers))
+                for trigger_id in order:
+                    trigger = triggers[trigger_id]
+                    item = StackItem(
+                        stack_item_id=f"stk_{self._next_stack_item_number:04d}",
+                        item_type="TRIGGER_ABILITY",
+                        source_id=trigger.source_id,
+                        controller_seat_id=seat_id,
+                        targets=trigger.targets,
+                        trigger_id=trigger.trigger_id,
+                    )
+                    self._next_stack_item_number += 1
+                    self.stack.append(item)
+                    placed.append(item)
+
+            self.pending_triggers.clear()
+            self._trigger_orders.clear()
+            self._expected_trigger_order_sequences.clear()
+            return tuple(placed)
 
     def resolve_top_stack_item(self) -> StackResolution:
         """Pop and resolve exactly one stack item using LIFO ordering."""
@@ -514,11 +833,22 @@ class GameSession:
                 )
 
             item = self.stack.pop()
-            definition = self._definition(item.source_id)
             changes: list[dict[str, Any]] = []
-            resolved = self._apply_spell_effect(item, definition, changes)
-            if definition.card_type not in PERMANENT_CARD_TYPES:
-                self.players[item.controller_seat_id].graveyard.append(item.source_id)
+            definition = self._definition(item.source_id)
+            if item.item_type == "ABILITY":
+                resolved = self._apply_activated_ability_effect(
+                    item, definition, changes
+                )
+            elif item.item_type == "TRIGGER_ABILITY":
+                resolved = self._apply_triggered_ability_effect(
+                    item, definition, changes
+                )
+            else:
+                resolved = self._apply_spell_effect(item, definition, changes)
+                if definition.card_type not in PERMANENT_CARD_TYPES:
+                    self.players[item.controller_seat_id].graveyard.append(
+                        item.source_id
+                    )
             changes.extend(self.apply_state_based_actions())
             self._priority_passes = 0
             return StackResolution(
@@ -665,6 +995,12 @@ class GameSession:
                     permanent["tapped"] = True
                 self.combat_attackers[creature_id] = target
                 self.combat_blockers[creature_id] = []
+                self._queue_trigger_for_source(
+                    creature_id,
+                    seat_id,
+                    TriggerEvent.ATTACKS,
+                    default_targets=(target,),
+                )
             self._expected_attackers_sequence = None
             if not normalized:
                 self.current_step = TurnStep.END_OF_COMBAT
@@ -1328,6 +1664,82 @@ class GameSession:
                 )
         return normalized
 
+    def _validate_activated_ability_targets(
+        self,
+        source_id: str,
+        definition: CardDefinition,
+        ability: ActivatedAbilitySpec,
+        targets: Sequence[str],
+    ) -> tuple[str, ...]:
+        normalized = tuple(targets)
+        if len(normalized) != 1 or not isinstance(normalized[0], str):
+            raise GameRuleError(
+                ErrorCode.ILLEGAL_TARGET,
+                f"{definition.name}'s activated ability requires exactly one target.",
+            )
+        target = normalized[0]
+        player_seat = self._seat_for_player_id(target)
+        located = self._find_permanent(target)
+        creature = (
+            located is not None and self._is_creature_permanent(located[1])
+        )
+
+        if ability.target == AbilityTarget.PLAYER:
+            if player_seat is None:
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_TARGET,
+                    f"{definition.name}'s activated ability must target a player.",
+                )
+            return normalized
+
+        if ability.target == AbilityTarget.TAPPED_CREATURE:
+            if not creature or not located[1].get("tapped"):
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_TARGET,
+                    f"{definition.name}'s activated ability must target a tapped creature.",
+                )
+        elif ability.target == AbilityTarget.ANY and player_seat is None and not creature:
+            raise GameRuleError(
+                ErrorCode.ILLEGAL_TARGET,
+                f"{definition.name}'s activated ability must target a player or creature.",
+            )
+
+        if creature and self._target_has_protection_from_source(source_id, target):
+            raise GameRuleError(
+                ErrorCode.ILLEGAL_TARGET,
+                f"{target} has protection from {definition.name}.",
+            )
+        return normalized
+
+    def _validate_ability_cost_payment(
+        self,
+        player: PlayerGameState,
+        definition: CardDefinition,
+        ability: ActivatedAbilitySpec,
+        cost_payment: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(cost_payment, Mapping):
+            raise GameRuleError(
+                ErrorCode.ILLEGAL_ACTION,
+                "cost_payment must contain tap and mana fields.",
+            )
+        if set(cost_payment) != {"tap", "mana"}:
+            raise GameRuleError(
+                ErrorCode.ILLEGAL_ACTION,
+                "cost_payment must contain exactly tap and mana fields.",
+            )
+        if cost_payment["tap"] is not ability.tap_cost:
+            raise GameRuleError(
+                ErrorCode.ILLEGAL_ACTION,
+                f"{definition.name}'s declared tap cost is incorrect.",
+            )
+        return self._select_mana_sources(
+            player,
+            action_name=f"{definition.name}'s activated ability",
+            expected=ability.mana_cost,
+            mana_payment=cost_payment["mana"],
+        )
+
     def _validate_mana_payment(
         self,
         player: PlayerGameState,
@@ -1362,10 +1774,48 @@ class GameSession:
         }
         if definition.generic_cost:
             expected["X"] = definition.generic_cost
+        return self._select_mana_sources(
+            player,
+            action_name=definition.name,
+            expected=expected,
+            mana_payment=mana_payment,
+        )
+
+    def _select_mana_sources(
+        self,
+        player: PlayerGameState,
+        *,
+        action_name: str,
+        expected: Mapping[str, int],
+        mana_payment: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(mana_payment, Mapping):
+            raise GameRuleError(
+                ErrorCode.INSUFFICIENT_MANA,
+                "Mana payment must be an object using W, U, B, R, G, and X keys.",
+            )
+        allowed_keys = {*MANA_COLORS, "X"}
+        if any(key not in allowed_keys for key in mana_payment):
+            raise GameRuleError(
+                ErrorCode.INSUFFICIENT_MANA,
+                "Mana payment contains an unsupported mana key.",
+            )
+        if any(
+            not isinstance(amount, int) or isinstance(amount, bool) or amount < 0
+            for amount in mana_payment.values()
+        ):
+            raise GameRuleError(
+                ErrorCode.INSUFFICIENT_MANA,
+                "Every mana payment amount must be a non-negative integer.",
+            )
+        declared = {
+            key: amount for key, amount in mana_payment.items() if amount
+        }
         if declared != expected:
             raise GameRuleError(
                 ErrorCode.INSUFFICIENT_MANA,
-                f"{definition.name} requires mana payment {expected}; received {declared}.",
+                f"{action_name} requires mana payment {dict(expected)}; "
+                f"received {declared}.",
             )
 
         available: list[tuple[dict[str, Any], str]] = []
@@ -1388,7 +1838,7 @@ class GameSession:
             if len(matching) < required:
                 raise GameRuleError(
                     ErrorCode.INSUFFICIENT_MANA,
-                    f"Not enough untapped {color} mana sources for {definition.name}.",
+                    f"Not enough untapped {color} mana sources for {action_name}.",
                 )
             for permanent in matching[:required]:
                 selected.append(permanent)
@@ -1403,7 +1853,7 @@ class GameSession:
         if len(generic_sources) < generic_required:
             raise GameRuleError(
                 ErrorCode.INSUFFICIENT_MANA,
-                f"Not enough untapped mana sources for {definition.name}'s generic cost.",
+                f"Not enough untapped mana sources for {action_name}'s generic cost.",
             )
         selected.extend(generic_sources[:generic_required])
         return selected
@@ -1433,6 +1883,11 @@ class GameSession:
                     "controller": self.player_id_for_seat(item.controller_seat_id),
                     "tapped": False,
                 }
+            )
+            self._queue_trigger_for_source(
+                item.source_id,
+                item.controller_seat_id,
+                TriggerEvent.ENTERS_BATTLEFIELD,
             )
             return True
 
@@ -1504,6 +1959,290 @@ class GameSession:
             return True
         return False
 
+    def _apply_activated_ability_effect(
+        self,
+        item: StackItem,
+        definition: CardDefinition,
+        changes: list[dict[str, Any]],
+    ) -> bool:
+        if item.ability_index is None:
+            return False
+        ability = activated_ability(definition.base_id, item.ability_index)
+        if ability is None or len(item.targets) != 1:
+            return False
+        target = item.targets[0]
+
+        if ability.effect == AbilityEffect.MILL:
+            target_seat = self._seat_for_player_id(target)
+            if target_seat is None:
+                return False
+            player = self.players[target_seat]
+            milled = player.library[: ability.amount]
+            del player.library[: ability.amount]
+            player.graveyard.extend(milled)
+            changes.append(
+                {
+                    "change_type": "MILL",
+                    "target": target,
+                    "card_ids": list(milled),
+                }
+            )
+            return True
+
+        located = self._find_permanent(target)
+        target_seat = self._seat_for_player_id(target)
+        if target_seat is None:
+            if located is None or not self._is_creature_permanent(located[1]):
+                return False
+            if self._target_has_protection_from_source(item.source_id, target):
+                return False
+
+        if ability.effect == AbilityEffect.DAMAGE:
+            if target_seat is not None:
+                self.players[target_seat].life -= ability.amount
+            else:
+                located[1]["damage"] = (
+                    int(located[1].get("damage", 0)) + ability.amount
+                )
+            changes.append(
+                {
+                    "change_type": "DAMAGE",
+                    "source": item.source_id,
+                    "target": target,
+                    "amount": ability.amount,
+                }
+            )
+            return True
+
+        if ability.effect == AbilityEffect.DESTROY:
+            if (
+                located is None
+                or not self._is_creature_permanent(located[1])
+                or not located[1].get("tapped")
+            ):
+                return False
+            owner_seat, permanent = located
+            self._move_permanent_to_graveyard(owner_seat, permanent)
+            changes.append(
+                {
+                    "change_type": "DESTROY",
+                    "source": item.source_id,
+                    "target": target,
+                }
+            )
+            return True
+        return False
+
+    def _apply_triggered_ability_effect(
+        self,
+        item: StackItem,
+        definition: CardDefinition,
+        changes: list[dict[str, Any]],
+    ) -> bool:
+        trigger = TRIGGERED_ABILITIES.get(definition.base_id)
+        if trigger is None:
+            return False
+
+        if trigger.effect == TriggerEffect.PROWESS:
+            located = self._find_permanent(item.source_id)
+            if located is not None and self._is_creature_permanent(located[1]):
+                permanent = located[1]
+                permanent["power"] = int(permanent["power"]) + 1
+                permanent["toughness"] = int(permanent["toughness"]) + 1
+                changes.append(
+                    {
+                        "change_type": "MODIFY_STATS",
+                        "source": item.source_id,
+                        "target": item.source_id,
+                        "power": 1,
+                        "toughness": 1,
+                        "duration": "END_OF_TURN",
+                    }
+                )
+            return True
+
+        if trigger.effect == TriggerEffect.SACRIFICE_SOURCE:
+            located = self._find_permanent(item.source_id)
+            if located is not None:
+                owner_seat, permanent = located
+                self._move_permanent_to_graveyard(owner_seat, permanent)
+                changes.append(
+                    {
+                        "change_type": "SACRIFICE",
+                        "target": item.source_id,
+                    }
+                )
+            return True
+
+        if trigger.effect == TriggerEffect.DEVOTION_DRAIN:
+            devotion = sum(
+                self._definition(str(permanent["id"])).colored_cost.get("B", 0)
+                for permanent in self.players[item.controller_seat_id].battlefield
+            )
+            opponent_seat = self.opposing_seat(item.controller_seat_id)
+            controller = self.players[item.controller_seat_id]
+            opponent = self.players[opponent_seat]
+            opponent.life -= devotion
+            controller.life += devotion
+            changes.extend(
+                [
+                    {
+                        "change_type": "LIFE_LOSS",
+                        "target": opponent.player_id,
+                        "amount": devotion,
+                    },
+                    {
+                        "change_type": "LIFE_GAIN",
+                        "target": controller.player_id,
+                        "amount": devotion,
+                    },
+                ]
+            )
+            return True
+
+        if trigger.effect == TriggerEffect.RETURN_CREATURE_FROM_GRAVEYARD:
+            if len(item.targets) != 1:
+                return False
+            target = item.targets[0]
+            controller = self.players[item.controller_seat_id]
+            if target not in controller.graveyard:
+                return False
+            if self._definition(target).card_type not in {
+                "Creature",
+                "Artifact Creature",
+            }:
+                return False
+            controller.graveyard.remove(target)
+            controller.hand.append(target)
+            changes.append(
+                {
+                    "change_type": "RETURN_TO_HAND",
+                    "target": target,
+                    "from": "GRAVEYARD",
+                }
+            )
+            return True
+
+        if trigger.effect == TriggerEffect.REVEAL_DEFENDER_TOP_CARD:
+            if len(item.targets) != 1:
+                return False
+            defending_seat = self._seat_for_player_id(item.targets[0])
+            if defending_seat is None:
+                return False
+            defender = self.players[defending_seat]
+            if not defender.library:
+                changes.append(
+                    {
+                        "change_type": "REVEAL",
+                        "player": defender.player_id,
+                        "card_id": None,
+                    }
+                )
+                return True
+            card_id = defender.library[0]
+            is_land = self._definition(card_id).card_type == "Land"
+            changes.append(
+                {
+                    "change_type": "REVEAL",
+                    "player": defender.player_id,
+                    "card_id": card_id,
+                    "is_land": is_land,
+                }
+            )
+            if is_land:
+                defender.library.pop(0)
+                defender.hand.append(card_id)
+                changes.append(
+                    {
+                        "change_type": "PUT_INTO_HAND",
+                        "player": defender.player_id,
+                        "card_id": card_id,
+                        "from": "LIBRARY_TOP",
+                    }
+                )
+            return True
+        return False
+
+    def _queue_controlled_triggers(
+        self, controller_seat_id: str, event: TriggerEvent
+    ) -> None:
+        for permanent in tuple(self.players[controller_seat_id].battlefield):
+            source_id = permanent.get("id")
+            if isinstance(source_id, str):
+                self._queue_trigger_for_source(
+                    source_id, controller_seat_id, event
+                )
+
+    def _queue_targeted_permanent_triggers(
+        self, targets: Sequence[str]
+    ) -> None:
+        for target in dict.fromkeys(targets):
+            located = self._find_permanent(target)
+            if located is not None:
+                controller_seat_id, _ = located
+                self._queue_trigger_for_source(
+                    target, controller_seat_id, TriggerEvent.BECOMES_TARGET
+                )
+
+    def _queue_trigger_for_source(
+        self,
+        source_id: str,
+        controller_seat_id: str,
+        event: TriggerEvent,
+        *,
+        default_targets: Sequence[str] = (),
+    ) -> PendingTrigger | None:
+        definition = self._definition(source_id)
+        spec = triggered_ability(definition.base_id, event)
+        if spec is None:
+            return None
+        trigger = PendingTrigger(
+            trigger_id=f"trg_{self._next_trigger_number:04d}",
+            source_id=source_id,
+            controller_seat_id=controller_seat_id,
+            spec=spec,
+            targets=tuple(default_targets),
+            accepted=None if spec.requires_target or spec.optional else True,
+        )
+        if spec.requires_target:
+            trigger.legal_targets = self._legal_targets_for_trigger(trigger)
+            if not trigger.legal_targets:
+                return None
+        self._next_trigger_number += 1
+        self.pending_triggers.append(trigger)
+        return trigger
+
+    def _legal_targets_for_trigger(
+        self, trigger: PendingTrigger
+    ) -> tuple[str, ...]:
+        if trigger.spec.effect == TriggerEffect.RETURN_CREATURE_FROM_GRAVEYARD:
+            return tuple(
+                card_id
+                for card_id in self.players[trigger.controller_seat_id].graveyard
+                if self._definition(card_id).card_type
+                in {"Creature", "Artifact Creature"}
+            )
+        return ()
+
+    def _pending_trigger(self, trigger_id: str) -> PendingTrigger:
+        trigger = next(
+            (
+                candidate
+                for candidate in self.pending_triggers
+                if candidate.trigger_id == trigger_id
+            ),
+            None,
+        )
+        if trigger is None:
+            raise GameRuleError(
+                ErrorCode.TRIGGER_CHOICE_INVALID,
+                f"Unknown pending trigger: {trigger_id}.",
+            )
+        return trigger
+
+    def _apnap_seats(self) -> tuple[str, str]:
+        return self.active_seat_id, self.opposing_seat(self.active_seat_id)
+
     def _seat_for_player_id(self, player_id: str) -> str | None:
         return next(
             (
@@ -1569,6 +2308,11 @@ class GameSession:
         )
 
     def _damage_is_prevented(self, source_id: str, target_id: str) -> bool:
+        return self._target_has_protection_from_source(source_id, target_id)
+
+    def _target_has_protection_from_source(
+        self, source_id: str, target_id: str
+    ) -> bool:
         source_color = self._definition(source_id).color
         color_name = COLOR_NAMES.get(source_color)
         return color_name is not None and self._has_keyword(

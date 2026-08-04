@@ -1,5 +1,12 @@
 """Shared foundation for the MTGNP client and server."""
 
+from .abilities import (
+    ACTIVATED_ABILITIES,
+    AbilityEffect,
+    AbilityTarget,
+    ActivatedAbilitySpec,
+    activated_ability,
+)
 from .catalog import CardCatalog, CatalogError, load_catalog
 from .framing import (
     ConnectionClosed,
@@ -35,8 +42,19 @@ from .protocol import (
     validate_pdu,
 )
 from .tracing import PDUTracer, TraceAction
+from .triggers import (
+    TRIGGERED_ABILITIES,
+    TriggerEffect,
+    TriggerEvent,
+    TriggerSpec,
+    triggered_ability,
+)
 
 __all__ = [
+    "ACTIVATED_ABILITIES",
+    "AbilityEffect",
+    "AbilityTarget",
+    "ActivatedAbilitySpec",
     "CardCatalog",
     "CatalogError",
     "CombatDamageResult",
@@ -64,6 +82,11 @@ __all__ = [
     "StackResolutionOutcome",
     "TurnStep",
     "TraceAction",
+    "TRIGGERED_ABILITIES",
+    "TriggerEffect",
+    "TriggerEvent",
+    "TriggerSpec",
+    "activated_ability",
     "decode_pdu",
     "encode_pdu",
     "load_catalog",
@@ -71,5 +94,6 @@ __all__ = [
     "receive_exact",
     "receive_frame",
     "send_frame",
+    "triggered_ability",
     "validate_pdu",
 ]

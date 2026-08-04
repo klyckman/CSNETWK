@@ -32,6 +32,46 @@ class ProtocolTests(unittest.TestCase):
         payload = encode_pdu(pdu, sender=Sender.CLIENT)
         self.assertEqual(decode_pdu(payload, sender=Sender.CLIENT), pdu)
 
+    def test_activate_ability_round_trip_uses_required_cost_shape(self) -> None:
+        pdu = {
+            "type": "ACTIVATE_ABILITY",
+            "seq_num": 9,
+            "source_id": "prodigal_sorcerer_001",
+            "ability_index": 0,
+            "targets": ["bob"],
+            "cost_payment": {"tap": True, "mana": {}},
+        }
+        payload = encode_pdu(pdu, sender=Sender.CLIENT)
+        self.assertEqual(decode_pdu(payload, sender=Sender.CLIENT), pdu)
+
+        pdu["ability_index"] = True
+        with self.assertRaises(PDUValidationError):
+            validate_pdu(pdu, sender=Sender.CLIENT)
+
+    def test_trigger_choice_response_accepts_one_optional_string_target(self) -> None:
+        pdu = {
+            "type": "TRIGGER_CHOICE_RESPONSE",
+            "seq_num": 12,
+            "trigger_id": "trg_0001",
+            "accept": True,
+            "chosen_target": "black_knight_001",
+        }
+        payload = encode_pdu(pdu, sender=Sender.CLIENT)
+        self.assertEqual(decode_pdu(payload, sender=Sender.CLIENT), pdu)
+
+        pdu["chosen_target"] = ["black_knight_001"]
+        with self.assertRaises(PDUValidationError):
+            validate_pdu(pdu, sender=Sender.CLIENT)
+
+    def test_concede_round_trip_identifies_the_sending_player(self) -> None:
+        pdu = {
+            "type": "CONCEDE",
+            "seq_num": 22,
+            "player_id": "alice",
+        }
+        payload = encode_pdu(pdu, sender=Sender.CLIENT)
+        self.assertEqual(decode_pdu(payload, sender=Sender.CLIENT), pdu)
+
     def test_unknown_type_has_protocol_error_code(self) -> None:
         with self.assertRaises(PDUValidationError) as caught:
             validate_pdu({"type": "NOPE", "seq_num": 1})
@@ -87,4 +127,3 @@ class ProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

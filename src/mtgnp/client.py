@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import shlex
 import socket
 import sys
@@ -12,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from .abilities import ACTIVATED_ABILITIES, activated_ability
 from .catalog import CardCatalog, CatalogError, MANA_COLORS, load_catalog
 from .framing import ConnectionClosed, FramedConnection
 from .protocol import MessageType, Sender
@@ -22,6 +24,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4444
 DEFAULT_DATA_DIRECTORY = Path(__file__).resolve().parents[2] / "data"
 DISPLAY_WIDTH = 78
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
+DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 10.0
 
 
 def load_deck_file(path: str | Path, catalog: CardCatalog) -> tuple[str, ...]:
@@ -52,6 +56,15 @@ class MTGNPClient:
         self.connection: FramedConnection | None = None
         self._sequence = 1
         self._sequence_lock = threading.Lock()
+        self._heartbeat_sequence = 1
+        self._heartbeat_lock = threading.RLock()
+        self._pending_ping: tuple[int, int] | None = None
+        self._pong_received = threading.Event()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_failed = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._receiver_thread: threading.Thread | None = None
+        self._incoming: queue.Queue[dict[str, Any] | Exception] = queue.Queue()
 
     def connect(self) -> None:
         stream = socket.create_connection((self.host, self.port))
@@ -81,14 +94,93 @@ class MTGNPClient:
             }
         )
 
-    def send_ping(self) -> None:
+    def send_ping(self) -> tuple[int, int]:
+        with self._heartbeat_lock:
+            seq_num = self._heartbeat_sequence
+            self._heartbeat_sequence += 1
+            timestamp = int(time.time() * 1000)
+            self._pending_ping = (seq_num, timestamp)
+            self._pong_received.clear()
         self._connection().send(
             {
                 "type": MessageType.PING.value,
-                "seq_num": self._next_client_sequence(),
-                "timestamp": int(time.time() * 1000),
+                "seq_num": seq_num,
+                "timestamp": timestamp,
             }
         )
+        return seq_num, timestamp
+
+    def start_heartbeat(
+        self,
+        *,
+        interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        timeout_seconds: float = DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
+    ) -> None:
+        if interval_seconds <= 0 or timeout_seconds <= 0:
+            raise ValueError("Heartbeat interval and timeout must be positive.")
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop.clear()
+        self._heartbeat_failed.clear()
+        self._start_receiver()
+        thread = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(interval_seconds, timeout_seconds),
+            name="mtgnp-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread = thread
+        thread.start()
+
+    @property
+    def heartbeat_failed(self) -> bool:
+        return self._heartbeat_failed.is_set()
+
+    def _start_receiver(self) -> None:
+        if self._receiver_thread is not None and self._receiver_thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=self._receiver_loop,
+            name="mtgnp-receiver",
+            daemon=True,
+        )
+        self._receiver_thread = thread
+        thread.start()
+
+    def _receiver_loop(self) -> None:
+        try:
+            while not self._heartbeat_stop.is_set():
+                pdu = self._connection().receive()
+                if pdu["type"] == MessageType.PONG.value:
+                    self._record_pong(pdu)
+                self._incoming.put(pdu)
+        except Exception as exc:
+            if not self._heartbeat_stop.is_set():
+                self._incoming.put(exc)
+
+    def _heartbeat_loop(
+        self, interval_seconds: float, timeout_seconds: float
+    ) -> None:
+        while not self._heartbeat_stop.wait(interval_seconds):
+            try:
+                self.send_ping()
+            except (ConnectionError, ConnectionClosed, OSError):
+                self._fail_heartbeat()
+                return
+            if not self._pong_received.wait(timeout_seconds):
+                self._fail_heartbeat()
+                return
+
+    def _record_pong(self, pdu: dict[str, Any]) -> None:
+        with self._heartbeat_lock:
+            if self._pending_ping == (pdu["seq_num"], pdu["timestamp"]):
+                self._pending_ping = None
+                self._pong_received.set()
+
+    def _fail_heartbeat(self) -> None:
+        self._heartbeat_failed.set()
+        if self.connection is not None:
+            self.connection.close()
 
     def send_mulligan_choice(
         self,
@@ -140,6 +232,58 @@ class MTGNPClient:
                 "mana_payment": dict(mana_payment),
             }
         )
+
+    def send_activate_ability(
+        self,
+        *,
+        request_seq_num: int,
+        source_id: str,
+        ability_index: int,
+        targets: Sequence[str],
+        cost_payment: dict[str, Any],
+    ) -> None:
+        self._connection().send(
+            {
+                "type": MessageType.ACTIVATE_ABILITY.value,
+                "seq_num": request_seq_num,
+                "source_id": source_id,
+                "ability_index": ability_index,
+                "targets": list(targets),
+                "cost_payment": dict(cost_payment),
+            }
+        )
+
+    def send_trigger_order_response(
+        self,
+        *,
+        request_seq_num: int,
+        ordered_trigger_ids: Sequence[str],
+    ) -> None:
+        self._connection().send(
+            {
+                "type": MessageType.TRIGGER_ORDER_RESPONSE.value,
+                "seq_num": request_seq_num,
+                "ordered_trigger_ids": list(ordered_trigger_ids),
+            }
+        )
+
+    def send_trigger_choice_response(
+        self,
+        *,
+        request_seq_num: int,
+        trigger_id: str,
+        accept: bool,
+        chosen_target: str | None = None,
+    ) -> None:
+        pdu: dict[str, Any] = {
+            "type": MessageType.TRIGGER_CHOICE_RESPONSE.value,
+            "seq_num": request_seq_num,
+            "trigger_id": trigger_id,
+            "accept": accept,
+        }
+        if chosen_target is not None:
+            pdu["chosen_target"] = chosen_target
+        self._connection().send(pdu)
 
     def send_attackers(
         self, *, request_seq_num: int, attackers: Sequence[dict[str, str]]
@@ -193,13 +337,33 @@ class MTGNPClient:
             }
         )
 
+    def send_concede(self, *, request_seq_num: int, player_id: str) -> None:
+        self._connection().send(
+            {
+                "type": MessageType.CONCEDE.value,
+                "seq_num": request_seq_num,
+                "player_id": player_id,
+            }
+        )
+
     def receive(self) -> dict[str, Any]:
-        return self._connection().receive()
+        if self._receiver_thread is None:
+            return self._connection().receive()
+        received = self._incoming.get()
+        if isinstance(received, Exception):
+            raise received
+        return received
 
     def close(self) -> None:
+        self._heartbeat_stop.set()
+        self._pong_received.set()
         if self.connection is not None:
             self.connection.close()
             self.connection = None
+        current = threading.current_thread()
+        for thread in (self._heartbeat_thread, self._receiver_thread):
+            if thread is not None and thread is not current:
+                thread.join(timeout=1)
 
     def _connection(self) -> FramedConnection:
         if self.connection is None:
@@ -263,7 +427,7 @@ def _render_game_state(state: dict[str, Any]) -> None:
     if stack:
         for item in stack:
             print(
-                f"    {item['stack_item_id']}: {item['source']} "
+                f"    {item['stack_item_id']} ({item['item_type']}): {item['source']} "
                 f"by {item['controller']} -> {item['targets']}"
             )
     else:
@@ -338,10 +502,34 @@ def _render_pdu(pdu: dict[str, Any]) -> None:
         print()
         return
     if message_type == MessageType.STACK_PUSH:
+        if pdu["item_type"] == "ABILITY":
+            action = "activated an ability of"
+        elif pdu["item_type"] == "TRIGGER_ABILITY":
+            action = "put a triggered ability from"
+        else:
+            action = "cast"
         print()
         print(
-            f"[STACK PUSH] {pdu['controller']} cast {pdu['source']} as "
+            f"[STACK PUSH] {pdu['controller']} {action} {pdu['source']} as "
             f"{pdu['stack_item_id']} targeting {pdu['targets']}."
+        )
+        print()
+        return
+    if message_type == MessageType.TRIGGER_CHOICE:
+        print()
+        print(
+            f"[TRIGGER CHOICE] {pdu['trigger_id']} from {pdu['source_id']}: "
+            f"{pdu['effect_summary']}"
+        )
+        if pdu["requires_target"]:
+            print(f"  Legal targets: {pdu['legal_targets']}")
+        print()
+        return
+    if message_type == MessageType.TRIGGER_ORDER:
+        print()
+        print(
+            f"[TRIGGER ORDER] {pdu['player_id']} must order simultaneous "
+            f"triggers {pdu['trigger_ids']} (first is Stack bottom)."
         )
         print()
         return
@@ -408,10 +596,32 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Automatically pass priority, declare no attackers or blockers, "
-            "order damage automatically, and discard to seven."
+            "make trigger choices, order damage automatically, and discard to seven."
         ),
     )
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=_positive_seconds,
+        default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        help="Seconds between PING heartbeats (default: 30).",
+    )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=_positive_seconds,
+        default=DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
+        help="Seconds to wait for the matching PONG (default: 10).",
+    )
     return parser
+
+
+def _positive_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return seconds
 
 
 def _choose_mulligan(
@@ -480,6 +690,42 @@ def _default_mana_payment(card_id: str, catalog: CardCatalog) -> dict[str, int]:
     return payment
 
 
+def _parse_mana_override(
+    action_tokens: Sequence[str], default: dict[str, int]
+) -> tuple[tuple[str, ...], dict[str, int]]:
+    if "--mana" not in action_tokens:
+        return tuple(action_tokens), dict(default)
+    if action_tokens.count("--mana") != 1:
+        raise ValueError("--mana may be supplied only once.")
+    marker = action_tokens.index("--mana")
+    targets = tuple(action_tokens[:marker])
+    payment_tokens = action_tokens[marker + 1 :]
+    if not payment_tokens:
+        raise ValueError("--mana must be followed by entries such as R=1,X=1.")
+    entries = [
+        entry
+        for token in payment_tokens
+        for entry in token.split(",")
+        if entry
+    ]
+    payment: dict[str, int] = {}
+    for entry in entries:
+        try:
+            color, raw_amount = entry.split("=", 1)
+            amount = int(raw_amount)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Invalid mana entry {entry!r}; use forms such as U=2 or B=1,X=1."
+            ) from exc
+        color = color.upper()
+        if color not in {"W", "U", "B", "R", "G", "X"} or amount < 0:
+            raise ValueError(f"Invalid mana entry {entry!r}.")
+        if color in payment:
+            raise ValueError(f"Mana key {color} was supplied more than once.")
+        payment[color] = amount
+    return targets, payment
+
+
 def _parse_priority_action(
     command: str, catalog: CardCatalog
 ) -> tuple[str, dict[str, Any]]:
@@ -488,52 +734,57 @@ def _parse_priority_action(
     except ValueError as exc:
         raise ValueError(f"Cannot parse action: {exc}") from exc
     if not tokens:
-        raise ValueError("Enter pass, land CARD_ID, or cast CARD_ID [TARGET ...].")
+        raise ValueError(
+            "Enter pass, concede, land CARD_ID, cast CARD_ID, or activate SOURCE_ID."
+        )
 
     action = tokens[0].lower()
     if action in {"pass", "p"} and len(tokens) == 1:
         return "pass", {}
+    if action in {"concede", "surrender"} and len(tokens) == 1:
+        return "concede", {}
     if action in {"land", "play"} and len(tokens) == 2:
         definition = catalog.definition_for_instance(tokens[1])
         if definition.card_type != "Land":
             raise ValueError(f"{definition.name} is not a land card.")
         return "land", {"card_id": tokens[1]}
+
+    if action in {"activate", "ability"}:
+        if len(tokens) < 4:
+            raise ValueError(
+                "Use activate SOURCE_ID ABILITY_INDEX TARGET [--mana ...]."
+            )
+        source_id = tokens[1]
+        definition = catalog.definition_for_instance(source_id)
+        try:
+            ability_index = int(tokens[2])
+        except ValueError as exc:
+            raise ValueError("ABILITY_INDEX must be a non-negative integer.") from exc
+        ability = activated_ability(definition.base_id, ability_index)
+        if ability is None:
+            raise ValueError(
+                f"{definition.name} ability {ability_index!r} is not supported."
+            )
+        targets, mana = _parse_mana_override(
+            tokens[3:], dict(ability.mana_cost)
+        )
+        return "activate", {
+            "source_id": source_id,
+            "ability_index": ability_index,
+            "targets": targets,
+            "cost_payment": {"tap": ability.tap_cost, "mana": mana},
+        }
+
     if action != "cast" or len(tokens) < 2:
-        raise ValueError("Use pass, land CARD_ID, or cast CARD_ID [TARGET ...].")
+        raise ValueError(
+            "Use pass, concede, land CARD_ID, cast CARD_ID, or activate SOURCE_ID."
+        )
 
     card_id = tokens[1]
     catalog.definition_for_instance(card_id)
-    action_tokens = tokens[2:]
-    if "--mana" in action_tokens:
-        marker = action_tokens.index("--mana")
-        targets = tuple(action_tokens[:marker])
-        payment_tokens = action_tokens[marker + 1 :]
-        if not payment_tokens:
-            raise ValueError("--mana must be followed by entries such as R=1,X=1.")
-        entries = [
-            entry
-            for token in payment_tokens
-            for entry in token.split(",")
-            if entry
-        ]
-        payment: dict[str, int] = {}
-        for entry in entries:
-            try:
-                color, raw_amount = entry.split("=", 1)
-                amount = int(raw_amount)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(
-                    f"Invalid mana entry {entry!r}; use forms such as U=2 or B=1,X=1."
-                ) from exc
-            color = color.upper()
-            if color not in {"W", "U", "B", "R", "G", "X"} or amount < 0:
-                raise ValueError(f"Invalid mana entry {entry!r}.")
-            if color in payment:
-                raise ValueError(f"Mana key {color} was supplied more than once.")
-            payment[color] = amount
-    else:
-        targets = tuple(action_tokens)
-        payment = _default_mana_payment(card_id, catalog)
+    targets, payment = _parse_mana_override(
+        tokens[2:], _default_mana_payment(card_id, catalog)
+    )
     return "cast", {
         "card_id": card_id,
         "targets": targets,
@@ -585,12 +836,20 @@ def _render_action_submission(
             f"CAST {fields['card_id']} -> {targets} "
             f"using {fields['mana_payment']}"
         )
+    elif action == "activate":
+        description = (
+            f"ACTIVATE {fields['source_id']} ability {fields['ability_index']} "
+            f"-> {list(fields.get('targets', ()))} using "
+            f"{fields['cost_payment']}"
+        )
     elif action == "attack":
         description = f"DECLARE ATTACKERS {fields.get('attackers', [])}"
     elif action == "block":
         description = f"DECLARE BLOCKERS {fields.get('blockers', [])}"
     elif action == "order":
         description = f"ASSIGN DAMAGE ORDER {fields.get('orders', [])}"
+    elif action == "concede":
+        description = "CONCEDE GAME"
     else:
         description = "PASS"
     prefix = "AUTO ACTION" if automatic else "ACTION SUBMITTED"
@@ -619,7 +878,25 @@ def _choose_priority_action(
         land_error = _land_action_error(state, player_id)
         if land_error is not None:
             print(f"Land play unavailable: {land_error}")
-    print("Actions: pass | land CARD_ID | cast CARD_ID [TARGET ...]")
+        ability_lines: list[str] = []
+        for permanent in state.get("battlefield", {}).get(player_id, []):
+            card_id = permanent.get("id")
+            if not isinstance(card_id, str):
+                continue
+            definition = catalog.definition_for_instance(card_id)
+            for index, ability in enumerate(
+                ACTIVATED_ABILITIES.get(definition.base_id, ())
+            ):
+                ability_lines.append(
+                    f"  {card_id} ability {index}: {ability.summary}"
+                )
+        if ability_lines:
+            print("Your supported activated abilities:")
+            print("\n".join(ability_lines))
+    print(
+        "Actions: pass | concede | land CARD_ID | cast CARD_ID [TARGET ...] | "
+        "activate SOURCE_ID ABILITY_INDEX TARGET"
+    )
     print("Mana is inferred from the catalog; add --mana R=1,X=1 to override.")
     while True:
         command = input("Action: ")
@@ -637,6 +914,16 @@ def _choose_priority_action(
             hand = state.get("hand", {}).get(player_id, [])
             if fields["card_id"] not in hand:
                 print(f"\n{fields['card_id']} is not in your current hand.\n")
+                continue
+        if state is not None and action == "activate":
+            controlled = {
+                permanent.get("id")
+                for permanent in state.get("battlefield", {}).get(player_id, [])
+            }
+            if fields["source_id"] not in controlled:
+                print(
+                    f"\n{fields['source_id']} is not on your battlefield.\n"
+                )
                 continue
         return action, fields
 
@@ -800,6 +1087,44 @@ def _choose_damage_orders(
     return orders
 
 
+def _choose_trigger_order(
+    pdu: dict[str, Any], *, automatic: bool
+) -> tuple[str, ...]:
+    trigger_ids = tuple(pdu["trigger_ids"])
+    if automatic:
+        return trigger_ids
+    print("Enter every trigger ID from Stack bottom to Stack top.")
+    while True:
+        selected = tuple(shlex.split(input("Trigger order: ")))
+        if len(set(selected)) == len(selected) and set(selected) == set(trigger_ids):
+            return selected
+        print(f"\nList every trigger exactly once: {list(trigger_ids)}.\n")
+
+
+def _choose_trigger_choice(
+    pdu: dict[str, Any], *, automatic: bool
+) -> tuple[bool, str | None]:
+    optional = bool(pdu.get("optional", False))
+    legal_targets = tuple(pdu["legal_targets"])
+    if optional and not automatic:
+        while True:
+            answer = input("Use this optional triggered ability? [y/n]: ").strip().lower()
+            if answer in {"n", "no"}:
+                return False, None
+            if answer in {"y", "yes"}:
+                break
+            print("Enter 'y' or 'n'.")
+    if pdu["requires_target"]:
+        if automatic:
+            return True, legal_targets[0]
+        while True:
+            target = input("Choose trigger target: ").strip()
+            if target in legal_targets:
+                return True, target
+            print(f"\nChoose one legal target from {list(legal_targets)}.\n")
+    return True, None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     try:
@@ -811,13 +1136,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     client = MTGNPClient(host=args.host, port=args.port, verbose=args.verbose)
     latest_state: dict[str, Any] | None = None
+    ready_after_game_over = False
     try:
         client.connect()
+        client.start_heartbeat(
+            interval_seconds=args.heartbeat_interval,
+            timeout_seconds=args.heartbeat_timeout,
+        )
         client.send_ready(args.player_id, deck_list)
         print(f"Connected to {args.host}:{args.port} as {args.player_id}.")
         while True:
             pdu = client.receive()
             _render_pdu(pdu)
+            if pdu["type"] == MessageType.GAME_OVER.value:
+                ready_after_game_over = True
             if (
                 pdu["type"] == MessageType.PHASE_TRANSITION.value
                 and latest_state is not None
@@ -826,7 +1158,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if pdu["type"] == MessageType.GAME_STATE_UPDATE.value:
                 state = pdu["state"]
                 latest_state = state
-                if (
+                if state.get("phase") == "LOBBY" and ready_after_game_over:
+                    client.send_ready(args.player_id, deck_list)
+                    ready_after_game_over = False
+                    print("Re-entered the Lobby and resubmitted the same deck.")
+                elif (
                     state.get("phase") == "MULLIGAN"
                     and not state["mulligan_kept"].get(args.player_id, False)
                 ):
@@ -849,6 +1185,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                     client.send_discard(
                         request_seq_num=pdu["seq_num"], card_ids=selected
                     )
+            elif pdu["type"] == MessageType.TRIGGER_CHOICE.value:
+                accept, chosen_target = _choose_trigger_choice(
+                    pdu, automatic=args.auto_pass
+                )
+                client.send_trigger_choice_response(
+                    request_seq_num=pdu["seq_num"],
+                    trigger_id=pdu["trigger_id"],
+                    accept=accept,
+                    chosen_target=chosen_target,
+                )
+                _render_action_submission(
+                    "trigger choice",
+                    {
+                        "trigger_id": pdu["trigger_id"],
+                        "accept": accept,
+                        "chosen_target": chosen_target,
+                    },
+                    automatic=args.auto_pass,
+                )
+            elif pdu["type"] == MessageType.TRIGGER_ORDER.value:
+                trigger_order = _choose_trigger_order(
+                    pdu, automatic=args.auto_pass
+                )
+                client.send_trigger_order_response(
+                    request_seq_num=pdu["seq_num"],
+                    ordered_trigger_ids=trigger_order,
+                )
+                _render_action_submission(
+                    "trigger order",
+                    {"ordered_trigger_ids": trigger_order},
+                    automatic=args.auto_pass,
+                )
             elif pdu["type"] == MessageType.PRIORITY_GRANT.value:
                 if args.auto_pass:
                     client.send_priority_pass(request_seq_num=pdu["seq_num"])
@@ -868,6 +1236,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                             card_id=fields["card_id"],
                             targets=fields["targets"],
                             mana_payment=fields["mana_payment"],
+                        )
+                    elif action == "activate":
+                        client.send_activate_ability(
+                            request_seq_num=pdu["seq_num"],
+                            source_id=fields["source_id"],
+                            ability_index=fields["ability_index"],
+                            targets=fields["targets"],
+                            cost_payment=fields["cost_payment"],
+                        )
+                    elif action == "concede":
+                        client.send_concede(
+                            request_seq_num=pdu["seq_num"],
+                            player_id=args.player_id,
                         )
                     else:
                         client.send_priority_pass(request_seq_num=pdu["seq_num"])
@@ -931,8 +1312,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
     except KeyboardInterrupt:
         print("Disconnecting client.")
-    except (ConnectionClosed, ConnectionRefusedError, ConnectionResetError, OSError) as exc:
-        print(f"Connection ended: {exc}", file=sys.stderr)
+    except (
+        ConnectionClosed,
+        ConnectionRefusedError,
+        ConnectionResetError,
+        OSError,
+    ) as exc:
+        if client.heartbeat_failed:
+            print("Connection ended: the server did not answer the heartbeat.", file=sys.stderr)
+        else:
+            print(f"Connection ended: {exc}", file=sys.stderr)
         return 1
     finally:
         client.close()
