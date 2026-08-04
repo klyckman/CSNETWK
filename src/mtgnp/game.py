@@ -19,6 +19,7 @@ from .abilities import (
 from .catalog import CardCatalog, CardDefinition, CatalogError, MANA_COLORS
 from .lobby import ReadyPlayer
 from .protocol import ErrorCode, LifecycleState, TurnStep
+from .spells import SPELLS, SpellEffect, SpellTarget, spell_spec
 from .triggers import (
     TRIGGERED_ABILITIES,
     TriggerEffect,
@@ -106,9 +107,7 @@ class CombatDamageResult:
     creatures_died: tuple[str, ...]
 
 
-SUPPORTED_EFFECTS = frozenset(
-    {"lightning_bolt", "unsummon", "counterspell", "giant_growth", "doom_blade"}
-)
+SUPPORTED_EFFECTS = frozenset(SPELLS)
 PERMANENT_CARD_TYPES = frozenset({"Creature", "Artifact Creature", "Artifact"})
 SORCERY_SPEED_CARD_TYPES = frozenset(
     {"Sorcery", "Creature", "Artifact Creature", "Artifact", "Enchantment"}
@@ -507,7 +506,9 @@ class GameSession:
                     f"{definition.name}'s effect is not implemented in this milestone.",
                 )
 
-            normalized_targets = self._validate_cast_targets(definition, targets)
+            normalized_targets = self._validate_cast_targets(
+                card_id, definition, targets
+            )
             mana_sources = self._validate_mana_payment(
                 player, definition, mana_payment
             )
@@ -1613,7 +1614,10 @@ class GameSession:
             raise GameRuleError(ErrorCode.ILLEGAL_ACTION, str(exc)) from exc
 
     def _validate_cast_targets(
-        self, definition: CardDefinition, targets: Sequence[str]
+        self,
+        card_id: str,
+        definition: CardDefinition,
+        targets: Sequence[str],
     ) -> tuple[str, ...]:
         normalized = tuple(targets)
         if any(not isinstance(target, str) for target in normalized):
@@ -1622,7 +1626,8 @@ class GameSession:
                 "Every spell target must be a player, permanent, or stack-item ID.",
             )
 
-        requires_one = definition.base_id in SUPPORTED_EFFECTS
+        spec = spell_spec(definition.base_id)
+        requires_one = spec is not None and spec.target != SpellTarget.NONE
         if requires_one and len(normalized) != 1:
             raise GameRuleError(
                 ErrorCode.ILLEGAL_TARGET,
@@ -1636,40 +1641,64 @@ class GameSession:
         if not requires_one:
             return normalized
 
+        if spec is None:
+            raise AssertionError("A targeted supported spell must have a specification.")
         target = normalized[0]
-        if definition.base_id == "lightning_bolt":
-            if self._seat_for_player_id(target) is None and not self._target_is_creature(target):
+        player_seat = self._seat_for_player_id(target)
+        located = self._find_permanent(target)
+        creature = located is not None and self._is_creature_permanent(located[1])
+
+        if spec.target == SpellTarget.ANY:
+            if player_seat is None and not creature:
                 raise GameRuleError(
                     ErrorCode.ILLEGAL_TARGET,
-                    "Lightning Bolt must target a player or creature.",
+                    f"{definition.name} must target a player or creature.",
                 )
-        elif definition.base_id in {"unsummon", "giant_growth"}:
-            if not self._target_is_creature(target):
+        elif spec.target == SpellTarget.PLAYER:
+            if player_seat is None:
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_TARGET,
+                    f"{definition.name} must target a player.",
+                )
+        elif spec.target == SpellTarget.CREATURE:
+            if not creature:
                 raise GameRuleError(
                     ErrorCode.ILLEGAL_TARGET,
                     f"{definition.name} must target a creature.",
                 )
-        elif definition.base_id == "doom_blade":
-            located = self._find_permanent(target)
-            if located is None or not self._is_creature_permanent(located[1]):
+            if (
+                spec.excluded_color is not None
+                and self._definition(target).color == spec.excluded_color
+            ):
                 raise GameRuleError(
                     ErrorCode.ILLEGAL_TARGET,
-                    "Doom Blade must target a creature.",
+                    f"{definition.name} cannot target that creature's color.",
                 )
-            if self._definition(target).color == "B":
-                raise GameRuleError(
-                    ErrorCode.ILLEGAL_TARGET,
-                    "Doom Blade cannot target a black creature.",
-                )
-        elif definition.base_id == "counterspell":
+        elif spec.target in {SpellTarget.SPELL, SpellTarget.NONCREATURE_SPELL}:
             target_item = next(
                 (item for item in self.stack if item.stack_item_id == target), None
             )
             if target_item is None or target_item.item_type != "SPELL":
                 raise GameRuleError(
                     ErrorCode.ILLEGAL_TARGET,
-                    "Counterspell must target a spell currently on the stack.",
+                    f"{definition.name} must target a spell currently on the stack.",
                 )
+            if spec.target == SpellTarget.NONCREATURE_SPELL:
+                target_definition = self._definition(target_item.source_id)
+                if target_definition.card_type in {
+                    "Creature",
+                    "Artifact Creature",
+                }:
+                    raise GameRuleError(
+                        ErrorCode.ILLEGAL_TARGET,
+                        f"{definition.name} cannot target a creature spell.",
+                    )
+
+        if creature and self._target_has_protection_from_source(card_id, target):
+            raise GameRuleError(
+                ErrorCode.ILLEGAL_TARGET,
+                f"{target} has protection from {definition.name}.",
+            )
         return normalized
 
     def _validate_activated_ability_targets(
@@ -1899,22 +1928,36 @@ class GameSession:
             )
             return True
 
+        spec = spell_spec(definition.base_id)
+        if spec is None:
+            return False
+        if spec.target == SpellTarget.NONE:
+            return False
         target = item.targets[0]
-        if definition.base_id == "lightning_bolt":
+
+        if spec.effect == SpellEffect.DAMAGE:
             player_seat = self._seat_for_player_id(target)
             if player_seat is not None:
-                self.players[player_seat].life -= 3
+                self.players[player_seat].life -= spec.amount
             else:
                 located = self._find_permanent(target)
                 if located is None or not self._is_creature_permanent(located[1]):
                     return False
-                located[1]["damage"] = int(located[1].get("damage", 0)) + 3
-            changes.append({"change_type": "DAMAGE", "target": target, "amount": 3})
+                if self._target_has_protection_from_source(item.source_id, target):
+                    return False
+                located[1]["damage"] = (
+                    int(located[1].get("damage", 0)) + spec.amount
+                )
+            changes.append(
+                {"change_type": "DAMAGE", "target": target, "amount": spec.amount}
+            )
             return True
 
-        if definition.base_id == "unsummon":
+        if spec.effect == SpellEffect.RETURN_TO_HAND:
             located = self._find_permanent(target)
             if located is None or not self._is_creature_permanent(located[1]):
+                return False
+            if self._target_has_protection_from_source(item.source_id, target):
                 return False
             owner_seat, permanent = located
             self.players[owner_seat].battlefield.remove(permanent)
@@ -1922,13 +1965,20 @@ class GameSession:
             changes.append({"change_type": "RETURN_TO_HAND", "target": target})
             return True
 
-        if definition.base_id == "counterspell":
+        if spec.effect == SpellEffect.COUNTER:
             target_item = next(
                 (candidate for candidate in self.stack if candidate.stack_item_id == target),
                 None,
             )
             if target_item is None or target_item.item_type != "SPELL":
                 return False
+            if spec.target == SpellTarget.NONCREATURE_SPELL:
+                target_definition = self._definition(target_item.source_id)
+                if target_definition.card_type in {
+                    "Creature",
+                    "Artifact Creature",
+                }:
+                    return False
             self.stack.remove(target_item)
             self.players[target_item.controller_seat_id].graveyard.append(
                 target_item.source_id
@@ -1945,22 +1995,27 @@ class GameSession:
         located = self._find_permanent(target)
         if located is None or not self._is_creature_permanent(located[1]):
             return False
+        if self._target_has_protection_from_source(item.source_id, target):
+            return False
         owner_seat, permanent = located
-        if definition.base_id == "giant_growth":
-            permanent["power"] = int(permanent["power"]) + 3
-            permanent["toughness"] = int(permanent["toughness"]) + 3
+        if spec.effect == SpellEffect.MODIFY_STATS:
+            permanent["power"] = int(permanent["power"]) + spec.power
+            permanent["toughness"] = int(permanent["toughness"]) + spec.toughness
             changes.append(
                 {
                     "change_type": "MODIFY_STATS",
                     "target": target,
-                    "power": 3,
-                    "toughness": 3,
+                    "power": spec.power,
+                    "toughness": spec.toughness,
                     "duration": "END_OF_TURN",
                 }
             )
             return True
-        if definition.base_id == "doom_blade":
-            if self._definition(target).color == "B":
+        if spec.effect == SpellEffect.DESTROY:
+            if (
+                spec.excluded_color is not None
+                and self._definition(target).color == spec.excluded_color
+            ):
                 return False
             self._move_permanent_to_graveyard(owner_seat, permanent)
             changes.append({"change_type": "DESTROY", "target": target})

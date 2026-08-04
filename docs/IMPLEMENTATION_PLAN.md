@@ -17,6 +17,15 @@ combat and effects depend.
 | 5. Resilience | Reconnect grace, timeout races, malformed-client isolation, repeat games | Disconnect, reconnect, expiry, heartbeat, and restart integration tests pass | Implemented |
 | 6. Submission | Contribution evidence, AI log, limitations, diagrams, finalized README PDF | Clean-clone demo on two machines; every member completes oral walkthrough | Local package implemented; external/manual gates pending |
 
+## Optional milestone sequence
+
+With the 100-point base stable, optional development now follows
+`OPTIONAL_MILESTONES.md`. The first slice, O1A, implements four additional burn
+spells and two additional counterspells through a shared declarative spell
+registry. O1B is next. Full-card-effect work takes priority over a GUI because
+it directly targets the rubric's +10 effect category and gives every later
+interface one authoritative rules engine to use.
+
 ## Rubric traceability
 
 - **Verbose prerequisite:** retain one tracing path shared by framing calls; do

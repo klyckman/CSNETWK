@@ -2,8 +2,8 @@
 
 MTGNP is a two-player, server-authoritative implementation of the Magic: The
 Gathering Multiplayer Network Protocol v1.0 for CSNETWK. The required base
-protocol and gameplay milestones are implemented. Full coverage of every card
-effect and graphical interfaces are intentionally left as optional work.
+protocol and gameplay milestones are implemented. Optional full-card-effect
+coverage is now in progress; graphical interfaces remain later optional work.
 
 ## Base milestone status
 
@@ -17,8 +17,20 @@ effect and graphical interfaces are intentionally left as optional work.
 | Resilience | Complete | PING/PONG, priority deadlines, concession, 30-second reconnect grace, repeat games |
 | Submission package | Locally complete | README/PDF, diagrams, AI disclosure, test matrix; LAN and cross-group checks require external participants |
 
-The automated suite currently contains 111 tests and uses only Python's
+The automated suite currently contains 120 tests and uses only Python's
 standard library at runtime.
+
+## Optional milestone status
+
+| Milestone | Status | Result |
+| --- | --- | --- |
+| O1A. Simple spell families | Complete | Declarative spell rules plus Shock, Lava Spike, Flame Slash, Searing Spear, Cancel, and Negate |
+| O1B. Zones and resources | Next | Naturalize, Terror, Raise Dead, Rampant Growth, Dark Ritual, and Incinerate |
+| O1C-O1F. Full catalog closure | Planned | Choices, special costs, permanent effects, then a 58-card coverage audit |
+| O2-O4. Creative features and demo | Planned | UI polish, one spectator/replay or GUI extension, and bonus demonstration hardening |
+
+The detailed order, card grouping, and acceptance gates are in
+`docs/OPTIONAL_MILESTONES.md`.
 
 ## Requirements
 
@@ -200,13 +212,15 @@ flowchart LR
 The base rubric requires at least five effects. The implementation exceeds
 that gate with spell effects, activated abilities, and triggered abilities.
 
-- Spells: Lightning Bolt, Unsummon, Counterspell, Giant Growth, Doom Blade
+- Spells: Lightning Bolt, Shock, Lava Spike, Flame Slash, Searing Spear,
+  Unsummon, Counterspell, Cancel, Negate, Giant Growth, Doom Blade
 - Activated abilities: Prodigal Sorcerer, Royal Assassin, Millstone, Rod of Ruin
 - Triggered abilities: Goblin Guide, Monastery Swiftspear, Phantasmal Bear,
   Gray Merchant of Asphodel, Gravedigger
 
 Dedicated demonstrations are available in `decks/ability_demo_*.json` and
-`decks/trigger_demo_*.json`.
+`decks/trigger_demo_*.json`. Optional milestone O1A can be played with
+`decks/optional_spells_red.json` and `decks/optional_spells_blue.json`.
 
 ## Test coverage
 
@@ -237,9 +251,9 @@ advance.
   increasing server sequence number, including separate broadcast copies. The
   explicit Section 11 exception reissues the current token unchanged after a
   rejected action while that player still holds priority.
-- Five spell effects and selected activated/triggered abilities are supported.
-  Full behavior for every catalog card is optional bonus work and is not yet
-  implemented.
+- Eleven spell effects and selected activated/triggered abilities are
+  supported. Full behavior for every catalog card is optional bonus work and
+  is being added through the O1 milestone sequence.
 - The required client is terminal-based. A graphical interface is optional.
 
 ## Work Distribution Matrix
@@ -286,6 +300,7 @@ tool is used.
 - `docs/COMBAT_DESIGN.md` - combat validation and damage
 - `docs/ACTIVATED_ABILITIES_DESIGN.md` - activated-ability registry and flow
 - `docs/TRIGGERED_ABILITIES_DESIGN.md` - triggers, choices, and APNAP ordering
+- `docs/OPTIONAL_MILESTONES.md` - ordered bonus roadmap and full-card-effect slices
 - `docs/RESILIENCE_DESIGN.md` - timeout, heartbeat, concession, and reconnect
 - `docs/ARCHITECTURE_AND_DEMO.md` - component and sequence walkthrough
 - `docs/INTEROPERABILITY_TEST_MATRIX.md` - required external test record
