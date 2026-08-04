@@ -1,144 +1,156 @@
+from __future__ import annotations
+
 import random
 import unittest
 
-from mtgnp.catalog import CardCatalog
-from mtgnp.game import GameSession, Permanent
-from mtgnp.protocol import Lifecycle, Phase
+from mtgnp.game import GameRuleError, GameSession, MulliganOutcome
+from mtgnp.lobby import ReadyPlayer
+from mtgnp.protocol import ErrorCode, LifecycleState, TurnStep
 
 
-P1_DECK = [
+ALICE_DECK = (
     "mountain_001",
     "mountain_002",
     "mountain_003",
     "mountain_004",
     "lightning_bolt_001",
-    "lightning_bolt_002",
     "shock_001",
+    "searing_spear_001",
     "goblin_guide_001",
-]
-P2_DECK = [
+)
+BOB_DECK = (
     "island_001",
     "island_002",
     "island_003",
     "island_004",
     "counterspell_001",
+    "cancel_001",
     "unsummon_001",
     "phantasmal_bear_001",
-    "air_elemental_001",
-]
+)
 
 
-class GameSessionTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.catalog = CardCatalog.load()
+def create_game(seed: int = 7) -> GameSession:
+    return GameSession(
+        (
+            ReadyPlayer("seat_1", "alice", ALICE_DECK),
+            ReadyPlayer("seat_2", "bob", BOB_DECK),
+        ),
+        random_source=random.Random(seed),
+    )
 
-    def new_setup_session(self) -> GameSession:
-        session = GameSession(self.catalog, rng=random.Random(7))
-        self.assertFalse(session.register_ready("seat_1", "alice", P1_DECK))
-        self.assertTrue(session.register_ready("seat_2", "bob", P2_DECK))
-        session.setup()
-        return session
 
-    def test_personalized_state_hides_opponent_hand(self) -> None:
-        session = self.new_setup_session()
-        alice_view = session.visible_state("seat_1")
-        self.assertEqual({"alice"}, set(alice_view["hand"]))
-        self.assertNotIn("bob", alice_view["hand"])
-        self.assertEqual(len(session.players["seat_2"].hand), alice_view["hand_counts"]["bob"])
+class GameSetupTests(unittest.TestCase):
+    def test_setup_initializes_life_shuffles_and_draws_personalized_hands(self) -> None:
+        game = create_game()
+        alice = game.visible_state("seat_1")
+        bob = game.visible_state("seat_2")
 
-    def test_london_mulligan_requires_one_bottom_after_one_redraw(self) -> None:
-        session = self.new_setup_session()
-        self.assertFalse(
-            session.mulligan_choice(
+        self.assertEqual(alice["phase"], "MULLIGAN")
+        self.assertEqual(alice["turn"], 0)
+        self.assertEqual(alice["life_totals"], {"alice": 20, "bob": 20})
+        self.assertEqual(len(alice["hand"]["alice"]), 7)
+        self.assertEqual(len(bob["hand"]["bob"]), 7)
+        self.assertNotIn("bob", alice["hand"])
+        self.assertNotIn("alice", bob["hand"])
+        self.assertEqual(alice["library_counts"], {"alice": 1, "bob": 1})
+        self.assertIn(alice["active_player"], {"alice", "bob"})
+
+    def test_short_legal_deck_draws_all_available_cards(self) -> None:
+        game = GameSession(
+            (
+                ReadyPlayer("seat_1", "alice", ("mountain_001",)),
+                ReadyPlayer("seat_2", "bob", ("island_001",)),
+            ),
+            random_source=random.Random(1),
+        )
+        self.assertEqual(game.visible_state("seat_1")["hand_counts"]["alice"], 1)
+        self.assertEqual(game.visible_state("seat_2")["library_counts"]["bob"], 0)
+
+    def test_stale_mulligan_token_does_not_change_state(self) -> None:
+        game = create_game()
+        game.record_mulligan_request("seat_1", 10)
+        before = game.visible_state("seat_1")
+        with self.assertRaises(GameRuleError) as caught:
+            game.process_mulligan(
+                "seat_1", seq_num=9, keep=True, cards_to_bottom=()
+            )
+        self.assertEqual(caught.exception.code, ErrorCode.STALE_ACTION)
+        self.assertEqual(game.visible_state("seat_1"), before)
+
+    def test_redraw_then_keep_bottoms_one_card(self) -> None:
+        game = create_game()
+        game.record_mulligan_request("seat_1", 10)
+        outcome = game.process_mulligan(
+            "seat_1", seq_num=10, keep=False, cards_to_bottom=()
+        )
+        self.assertEqual(outcome, MulliganOutcome.REDRAW)
+        redrawn = game.visible_state("seat_1")
+        self.assertEqual(redrawn["mulligans_taken"]["alice"], 1)
+        self.assertEqual(redrawn["hand_counts"]["alice"], 7)
+
+        game.record_mulligan_request("seat_1", 11)
+        selected = redrawn["hand"]["alice"][0]
+        outcome = game.process_mulligan(
+            "seat_1", seq_num=11, keep=True, cards_to_bottom=(selected,)
+        )
+        self.assertEqual(outcome, MulliganOutcome.WAITING_FOR_OPPONENT)
+        kept = game.visible_state("seat_1")
+        self.assertEqual(kept["hand_counts"]["alice"], 6)
+        self.assertEqual(kept["library_counts"]["alice"], 2)
+        self.assertTrue(kept["mulligan_kept"]["alice"])
+
+    def test_invalid_bottom_count_is_atomic_and_can_be_retried(self) -> None:
+        game = create_game()
+        game.record_mulligan_request("seat_1", 10)
+        game.process_mulligan("seat_1", seq_num=10, keep=False, cards_to_bottom=())
+        game.record_mulligan_request("seat_1", 11)
+        before = game.visible_state("seat_1")
+
+        with self.assertRaises(GameRuleError) as caught:
+            game.process_mulligan(
+                "seat_1", seq_num=11, keep=True, cards_to_bottom=()
+            )
+        self.assertEqual(caught.exception.code, ErrorCode.ILLEGAL_ACTION)
+        self.assertEqual(game.visible_state("seat_1"), before)
+
+        selected = before["hand"]["alice"][0]
+        outcome = game.process_mulligan(
+            "seat_1", seq_num=11, keep=True, cards_to_bottom=(selected,)
+        )
+        self.assertEqual(outcome, MulliganOutcome.WAITING_FOR_OPPONENT)
+
+    def test_malformed_bottom_card_entry_is_rejected_without_crashing(self) -> None:
+        game = create_game()
+        game.record_mulligan_request("seat_1", 10)
+        before = game.visible_state("seat_1")
+        with self.assertRaises(GameRuleError) as caught:
+            game.process_mulligan(
                 "seat_1",
-                keep=False,
-                cards_to_bottom=[],
-            )
-        )
-        bottom = session.players["seat_1"].hand[0]
-        self.assertFalse(
-            session.mulligan_choice(
-                "seat_1",
+                seq_num=10,
                 keep=True,
-                cards_to_bottom=[bottom],
+                cards_to_bottom=({},),
             )
-        )
-        self.assertTrue(
-            session.mulligan_choice(
-                "seat_2",
-                keep=True,
-                cards_to_bottom=[],
-            )
-        )
-        self.assertEqual(6, len(session.players["seat_1"].hand))
-        self.assertEqual(bottom, session.players["seat_1"].library[0])
+        self.assertEqual(caught.exception.code, ErrorCode.ILLEGAL_ACTION)
+        self.assertEqual(game.visible_state("seat_1"), before)
 
-    def test_lightning_bolt_uses_mana_and_resolves_server_side(self) -> None:
-        session = self.new_setup_session()
-        session.lifecycle = Lifecycle.IN_GAME
-        session.phase = Phase.PRECOMBAT_MAIN
-        session.active_slot = "seat_1"
-        session.priority_slot = "seat_1"
-        alice = session.players["seat_1"]
-        alice.hand = ["lightning_bolt_001"]
-        mountain = Permanent("mountain_001", "seat_1", "seat_1")
-        alice.battlefield = [mountain]
-
-        item = session.cast_spell(
-            "seat_1",
-            "lightning_bolt_001",
-            ["bob"],
-            {"R": 1},
+    def test_both_keeps_begin_turn_one_untap(self) -> None:
+        game = create_game()
+        game.record_mulligan_request("seat_1", 20)
+        game.record_mulligan_request("seat_2", 21)
+        first = game.process_mulligan(
+            "seat_1", seq_num=20, keep=True, cards_to_bottom=()
         )
-        self.assertTrue(mountain.tapped)
-        self.assertEqual(item, session.stack[-1])
-        resolved, result, changes = session.resolve_top()
-        self.assertEqual(item, resolved)
-        self.assertEqual("RESOLVED", result)
-        self.assertEqual(17, session.players["seat_2"].life)
-        self.assertEqual("DAMAGE", changes[0]["change_type"])
-        self.assertIn("lightning_bolt_001", alice.graveyard)
-
-    def test_counterspell_resolves_lifo_and_counters_target_spell(self) -> None:
-        session = self.new_setup_session()
-        session.lifecycle = Lifecycle.IN_GAME
-        session.phase = Phase.PRECOMBAT_MAIN
-        session.active_slot = "seat_1"
-        session.priority_slot = "seat_1"
-        alice = session.players["seat_1"]
-        bob = session.players["seat_2"]
-        alice.hand = ["lightning_bolt_001"]
-        alice.battlefield = [Permanent("mountain_001", "seat_1", "seat_1")]
-        bob.hand = ["counterspell_001"]
-        bob.battlefield = [
-            Permanent("island_001", "seat_2", "seat_2"),
-            Permanent("island_002", "seat_2", "seat_2"),
-        ]
-
-        bolt = session.cast_spell(
-            "seat_1",
-            "lightning_bolt_001",
-            ["bob"],
-            {"R": 1},
+        second = game.process_mulligan(
+            "seat_2", seq_num=21, keep=True, cards_to_bottom=()
         )
-        session.priority_slot = "seat_2"
-        counter = session.cast_spell(
-            "seat_2",
-            "counterspell_001",
-            [bolt.stack_item_id],
-            {"U": 2},
-        )
-        resolved, result, changes = session.resolve_top()
-        self.assertEqual(counter, resolved)
-        self.assertEqual("RESOLVED", result)
-        self.assertEqual("COUNTER", changes[0]["change_type"])
-        self.assertEqual([], session.stack)
-        self.assertIn("counterspell_001", bob.graveyard)
-        self.assertIn("lightning_bolt_001", alice.graveyard)
-        self.assertEqual(20, bob.life)
+        self.assertEqual(first, MulliganOutcome.WAITING_FOR_OPPONENT)
+        self.assertEqual(second, MulliganOutcome.ALL_PLAYERS_KEPT)
+        self.assertEqual(game.lifecycle_state, LifecycleState.IN_GAME)
+        self.assertEqual(game.turn, 1)
+        self.assertEqual(game.current_step, TurnStep.UNTAP)
+        self.assertEqual(game.visible_state("seat_1")["phase"], "UNTAP")
 
 
 if __name__ == "__main__":
     unittest.main()
-

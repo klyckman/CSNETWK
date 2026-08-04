@@ -1,172 +1,181 @@
 # MTGNP
 
-Starter implementation of **Magic: The Gathering Multiplayer Network Protocol
-(MTGNP) v1.0** for CSNETWK. The project uses an authoritative Python TCP server
-and two thin interactive clients. It has no third-party runtime dependencies.
+Clean implementation of the Magic: The Gathering Multiplayer Network Protocol
+(MTGNP) v1.0 for CSNETWK.
 
-This repository is an implementation foundation, not the final submission.
-Transport, catalog validation, lobby/setup/mulligan, hidden-state rendering,
-heartbeats, pass-driven turns, basic land/mana handling, the stack, and a small
-effect registry are implemented. Full combat, triggers, and the remaining card
-effects are explicitly tracked as later milestones.
+## Current milestone
 
-## What is included
+This project currently implements the shared protocol/data and TCP transport
+foundation:
 
-- Four-byte big-endian JSON message framing with the 65,535-byte limit
-- Structural definitions for all 25 RFC PDU types and all RFC error codes
-- Server-authoritative state with personalized hand visibility
-- Exactly two server seats; later connections are refused
-- Deck validation against the supplied 58-card/312-instance catalog
-- `LOBBY -> GAME_SETUP -> MULLIGAN -> IN_GAME -> GAME_OVER -> LOBBY`
-- London mulligans, priority tokens, stale-action rejection, and cleanup discard
-- PING/PONG client heartbeat and server priority timeout
-- `--verbose` on both programs, plus `verbose on|off` in the client
-- Land play, implicit mana-source selection, LIFO stack resolution, and initial
-  effects for Lightning Bolt, Shock, Searing Spear, Lava Spike, Flame Slash,
-  Counterspell, Cancel, Unsummon, Giant Growth, and Doom Blade
-- Sample decks and standard-library unit tests
-- The supplied RFC/rubric under `docs/`
+- validated loading of the supplied 58-card, 312-instance catalog;
+- reconciliation of the master list, instance list, and color summary;
+- legal deck validation for 1 to 50 known card-instance IDs;
+- constants for every RFC PDU, error code, lifecycle state, and turn step;
+- sender and required-field definitions for all 25 PDU types;
+- UTF-8 JSON PDU encoding, decoding, and base structural validation;
+- exact-byte TCP reads and four-byte big-endian length framing;
+- rejection of frames larger than the 65,535-byte RFC limit;
+- a thread-safe validated connection wrapper for client and server use;
+- complete, labeled PDU tracing that can be toggled at runtime;
+- standard-library unit tests for the foundation.
 
-## Requirements and setup
+The project also includes its first runnable vertical slice:
 
-- Python 3.11 or newer
-- Three terminals for a normal local demo: one server and two clients
+- a TCP server on port `4444` with exactly two reusable seats;
+- immediate closure/refusal of additional connections while both seats are full;
+- a minimal client that submits `PLAYER_READY` and renders lobby state;
+- legal deck and unique player-ID enforcement;
+- per-PDU server sequence numbers and RFC `ERROR` responses;
+- `PING`/`PONG` handling;
+- `--verbose` support in both executable programs;
+- two sample legal deck files.
 
-From the repository root in PowerShell:
+The setup/mulligan state engine now also provides:
+
+- automatic transition from two ready players into `GAME_SETUP`;
+- server-side shuffling, 20 starting life, opening hands, and random first player;
+- personalized state that never reveals the opponent's hand;
+- sequence-token-validated London mulligans and bottom-card selection;
+- transition to turn 1 `UNTAP` after both players keep.
+
+The turn engine foundation additionally supports:
+
+- automatic Untap, Draw, Cleanup, active-player switching, and turn increments;
+- the first player's turn-1 draw skip;
+- priority grants, tokens, consecutive passes, and phase advancement;
+- empty-attacker combat traversal through End of Combat;
+- cleanup discard requests and graveyard movement;
+- empty-library `GAME_OVER` followed by a same-connection return to Lobby;
+- interactive decisions or unattended operation with `--auto-pass`.
+
+The resource, spell, and Stack milestone now supports:
+
+- one active-player land play during either Main Phase;
+- implicit, atomic tapping of basic lands from declared `mana_payment`;
+- visible per-player mana availability from untapped basic lands;
+- instant-speed and sorcery-speed timing checks;
+- server-authoritative `CAST_SPELL`, `STACK_PUSH`, and LIFO `STACK_RESOLVE`;
+- creatures and artifacts entering the battlefield after resolution;
+- Lightning Bolt, Unsummon, Counterspell, Giant Growth, and Doom Blade;
+- zero-toughness, lethal-damage, and `LIFE_ZERO` state-based actions;
+- interactive `pass`, `land`, and `cast` terminal commands;
+- two longer demonstration decks for manual Stack testing.
+
+The creature-combat milestone additionally supports:
+
+- atomic attacker validation, tapping, summoning sickness, haste, vigilance,
+  and defender restrictions;
+- defender-controlled blocker assignments, including multiple blockers;
+- flying and protection-based blocking restrictions;
+- attacker-selected damage order for multi-blocker combat;
+- first-strike and regular simultaneous damage steps;
+- server-broadcast `COMBAT_DAMAGE_RESULT`, creature deaths, player damage, and
+  combat-based `LIFE_ZERO` wins;
+- interactive attacker, blocker, and damage-order terminal prompts.
+
+Activated abilities, triggers, concession, enforced priority timeouts, and
+disconnect grace remain later milestones.
+
+## Run the tests
+
+From this directory in PowerShell:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e .
+$env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 ```
 
-No package download is required by the project itself.
+The project has no third-party runtime or test dependencies.
 
-## Run a local game
+## Run the lobby locally
+
+Open three PowerShell terminals in this directory. Set the source path in each:
+
+```powershell
+$env:PYTHONPATH = "src"
+```
 
 Terminal 1:
 
 ```powershell
-mtgnp-server --verbose
+python -m mtgnp.server --verbose
 ```
 
 Terminal 2:
 
 ```powershell
-mtgnp-client --player-id alice --deck .\decks\red_burn.json --verbose
+python -m mtgnp.client --player-id alice --deck decks/stack_demo_red_green.json --auto-keep
 ```
 
 Terminal 3:
 
 ```powershell
-mtgnp-client --player-id bob --deck .\decks\blue_control.json --verbose
+python -m mtgnp.client --player-id bob --deck decks/stack_demo_blue_black.json --auto-keep
 ```
 
-The default host is `127.0.0.1` for clients, the server binds to `0.0.0.0`, and
-the default TCP port is `4444`. Use `--host` and `--port` to change them.
+Each client displays its private opening hand and asks whether to keep or
+mulligan. Add `--auto-keep` to both client commands for a non-interactive setup
+smoke test. Add `--auto-pass` as well to let the turn engine run unattended.
+With the eight-card sample decks, it eventually demonstrates cleanup discard
+and `DECK_EMPTY` game over, then returns both connections to Lobby. Stop a
+program with `Ctrl+C`.
 
-Verbose mode is a grading prerequisite. With `--verbose`, every PDU is printed
-with direction, peer, timestamp, and formatted JSON on both the client and
-server. A client can also switch tracing during a run with `verbose on` or
-`verbose off`.
+## Try land play and spell casting
 
-Useful client commands:
+For a longer manual game, start the clients without `--auto-pass` and use the
+Stack demo decks:
+
+```powershell
+python -m mtgnp.client --player-id alice --deck decks/stack_demo_red_green.json --auto-keep
+python -m mtgnp.client --player-id bob --deck decks/stack_demo_blue_black.json --auto-keep
+```
+
+When a client receives priority, it accepts these commands:
 
 ```text
-keep [CARD_ID ...]
-mulligan
 pass
-land CARD_ID
-cast CARD_ID [TARGET ...] --mana R=1,X=1
-attack none
-discard CARD_ID [CARD_ID ...]
-concede
-state
-help
+land mountain_001
+cast goblin_guide_001
+cast lightning_bolt_001 bob
+cast counterspell_001 stk_0001
+cast doom_blade_001 goblin_guide_001
 ```
 
-Use `-` when a cast has no target, for example:
+Mana payment is inferred from the catalog. An explicit payment can be supplied
+when diagnosing protocol behavior, for example:
 
 ```text
-cast goblin_guide_001 - --mana R=1
+cast doom_blade_001 goblin_guide_001 --mana B=1,X=1
 ```
 
-## Design
+Combat decisions use guided prompts. Attacker declarations accept creature
+IDs separated by spaces or `none`. Blocker declarations use
+`BLOCKER_ID=ATTACKER_ID` pairs, for example:
 
-| Module | Responsibility |
-| --- | --- |
-| `protocol.py` | PDU names, directions, required fields, errors, phases |
-| `framing.py` | exact TCP reads/writes and big-endian length framing |
-| `catalog.py` | CSV loading, cross-file reconciliation, deck validation |
-| `game.py` | authoritative, transport-independent rules and visible state |
-| `server.py` | two-client coordination, sequencing, timeouts, broadcasts |
-| `client.py` | thin rendering, commands, heartbeat, runtime verbose toggle |
+```text
+phantasmal_bear_001=goblin_guide_001
+```
 
-The server owns every game mutation. The client stores only the last visible
-state and the current request/priority token. Card data remains in the supplied
-CSV files so card facts are not duplicated across source modules.
+When several creatures block one attacker, the attacking client is prompted
+to list those blocker IDs from first damaged to last.
 
-## Current limitations
+## Data ownership
 
-- Non-empty attacker declarations, blockers, damage order, first/double strike,
-  and combat damage are not implemented yet. `attack none` advances the turn.
-- Activated abilities, triggered abilities, trigger ordering/choice, Auras, and
-  most of the 58 card effects are not implemented. Permanent spells can enter
-  with their printed base stats, but ability text other than basic mana and
-  Haste is not applied yet.
-- A disconnected player currently loses immediately. The RFC requires a
-  reconnect grace period but does not define a reconnect/authentication PDU.
-- Mana is paid atomically from untapped sources and no floating mana pool is
-  retained. Advanced alternate costs, kicker, suspend, madness, and prevention
-  effects remain future work.
-- The RFC permits 1-50 card decks but also requires a seven-card opening hand.
-  This implementation accepts a 1-6 card deck, draws all available cards, and
-  applies `DECK_EMPTY` on the next required draw.
+The CSV files under `data/` are local copies of the instructor-supplied
+catalog. `master_card_list.csv` defines card facts, `card_instances.csv`
+defines the legal IDs exchanged by the protocol, and `color_summary.csv` is
+used as a consistency check only.
 
-See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for the
-rubric-ordered roadmap and specification ambiguities.
-
-## Team workflow
-
-Use one short-lived branch per feature, keep commits focused, and require a
-second group member to review each pull request. Merge only after the unit tests
-pass and the contributor can explain the relevant PDU exchange.
-
-### Work Distribution Matrix
-
-Fill this with real contributions before submission. Do not estimate or assign
-credit in advance.
-
-| Task / Feature | Member 1 | Member 2 | Member 3 | Member 4 |
-| --- | --- | --- | --- | --- |
-| TCP server, framing, dispatch | TBD | TBD | TBD | TBD |
-| Lobby, setup, mulligan | TBD | TBD | TBD | TBD |
-| Turn and phase engine | TBD | TBD | TBD | TBD |
-| Priority, stack, effects | TBD | TBD | TBD | TBD |
-| Combat | TBD | TBD | TBD | TBD |
-| Client and state rendering | TBD | TBD | TBD | TBD |
-| Error handling, heartbeat, disconnect | TBD | TBD | TBD | TBD |
-| Tests and interoperability | TBD | TBD | TBD | TBD |
-| Documentation and demo preparation | TBD | TBD | TBD | TBD |
-
-## AI Usage
-
-OpenAI Codex was used to:
-
-- read and reconcile the supplied RFC, rubric, and three CSV files;
-- identify specification ambiguities and create the rubric-ordered plan;
-- generate this initial Python architecture, protocol/catalog foundation,
-  client/server scaffold, and tests; and
-- run automated checks and correct issues found during validation.
-
-Every group member must review, test, and understand this code before it is
-submitted or demonstrated. Update this section whenever another AI tool or a
-new AI-assisted task is used.
-
-## Submission documentation
-
-The rubric asks for the README in PDF form. Keep this Markdown file as the
-editable source, complete the contribution matrix and limitations at code
-freeze, then export the final version as `README.pdf`. Do not freeze the PDF
-while project facts are still changing.
+See `docs/FOUNDATION_DECISIONS.md` for specification interpretations that must
+remain visible to the group and be confirmed with the instructor. The framing
+and concurrency decisions are described in `docs/TRANSPORT_DESIGN.md`.
+The current state and scope boundary are described in `docs/LOBBY_DESIGN.md`.
+Setup, hidden-state, and mulligan decisions are described in
+`docs/GAME_SETUP_DESIGN.md`.
+Turn, priority-pass, and cleanup behavior are described in
+`docs/TURN_ENGINE_DESIGN.md`.
+Land, mana, spell, Stack, and effect behavior are described in
+`docs/STACK_AND_SPELLS_DESIGN.md`.
+Attacker, blocker, and combat-damage behavior is described in
+`docs/COMBAT_DESIGN.md`.

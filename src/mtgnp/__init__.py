@@ -1,4 +1,75 @@
-"""Magic: The Gathering Multiplayer Network Protocol (MTGNP)."""
+"""Shared foundation for the MTGNP client and server."""
 
-__version__ = "0.1.0"
+from .catalog import CardCatalog, CatalogError, load_catalog
+from .framing import (
+    ConnectionClosed,
+    FrameTooLarge,
+    FramedConnection,
+    pack_frame,
+    receive_frame,
+    receive_exact,
+    send_frame,
+)
+from .game import (
+    CombatDamageResult,
+    DiscardOutcome,
+    DrawOutcome,
+    GameRuleError,
+    GameSession,
+    MulliganOutcome,
+    PriorityPassOutcome,
+    StackItem,
+    StackResolution,
+    StackResolutionOutcome,
+)
+from .lobby import Lobby, LobbyError, LobbyFull, ReadyPlayer
+from .protocol import (
+    ErrorCode,
+    LifecycleState,
+    MessageType,
+    PDUValidationError,
+    Sender,
+    TurnStep,
+    decode_pdu,
+    encode_pdu,
+    validate_pdu,
+)
+from .tracing import PDUTracer, TraceAction
 
+__all__ = [
+    "CardCatalog",
+    "CatalogError",
+    "CombatDamageResult",
+    "ConnectionClosed",
+    "DiscardOutcome",
+    "DrawOutcome",
+    "ErrorCode",
+    "FrameTooLarge",
+    "FramedConnection",
+    "GameRuleError",
+    "GameSession",
+    "LifecycleState",
+    "Lobby",
+    "LobbyError",
+    "LobbyFull",
+    "MessageType",
+    "MulliganOutcome",
+    "PDUValidationError",
+    "PDUTracer",
+    "PriorityPassOutcome",
+    "ReadyPlayer",
+    "Sender",
+    "StackItem",
+    "StackResolution",
+    "StackResolutionOutcome",
+    "TurnStep",
+    "TraceAction",
+    "decode_pdu",
+    "encode_pdu",
+    "load_catalog",
+    "pack_frame",
+    "receive_exact",
+    "receive_frame",
+    "send_frame",
+    "validate_pdu",
+]
