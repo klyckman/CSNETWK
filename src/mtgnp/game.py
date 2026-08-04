@@ -245,6 +245,14 @@ class GameSession:
                 return None
             return self.players[self.priority_holder_seat_id].player_id
 
+    def priority_token_for_seat(self, seat_id: str) -> int | None:
+        """Return the current token only when this seat still holds priority."""
+
+        with self._lock:
+            if seat_id != self.priority_holder_seat_id:
+                return None
+            return self._expected_priority_sequence
+
     def player_id_for_seat(self, seat_id: str) -> str:
         with self._lock:
             return self._player(seat_id).player_id

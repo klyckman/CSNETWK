@@ -261,11 +261,14 @@ class ServerIntegrationTests(unittest.TestCase):
         spoof_error = clients[active].receive()
         self.assertEqual(spoof_error["type"], "ERROR")
         self.assertEqual(spoof_error["code"], "ILLEGAL_ACTION")
+        retry_grant = clients[active].receive()
+        self.assertEqual(retry_grant["type"], "PRIORITY_GRANT")
+        self.assertEqual(retry_grant["seq_num"], grant["seq_num"])
 
         clients[active].send(
             {
                 "type": "CONCEDE",
-                "seq_num": grant["seq_num"],
+                "seq_num": retry_grant["seq_num"],
                 "player_id": active,
             }
         )
@@ -341,6 +344,52 @@ class ServerIntegrationTests(unittest.TestCase):
         while "PONG" not in received_types:
             received_types.append(clients[other].receive()["type"])
         self.assertIn("PONG", received_types)
+
+    def test_rejected_priority_action_reuses_current_token(self) -> None:
+        decks = {
+            "alice": ["mountain_001", "lightning_bolt_001"],
+            "bob": ["island_001", "counterspell_001"],
+        }
+        clients, active, other, grant = self.connect_kept_game(
+            decks["alice"], decks["bob"]
+        )
+        land_id = decks[active][0]
+        clients[active].send(
+            {
+                "type": "PLAY_LAND",
+                "seq_num": grant["seq_num"],
+                "card_id": land_id,
+            }
+        )
+
+        error = clients[active].receive()
+        retry = clients[active].receive()
+        self.assertEqual(error["type"], "ERROR")
+        self.assertEqual(error["code"], "WRONG_PHASE")
+        self.assertEqual(retry["type"], "PRIORITY_GRANT")
+        self.assertEqual(retry["seq_num"], grant["seq_num"])
+        self.assertEqual(
+            self.server.game.priority_token_for_seat(
+                self.server.game.priority_holder_seat_id
+            ),
+            grant["seq_num"],
+        )
+
+        clients[active].send(
+            {"type": "PRIORITY_PASS", "seq_num": retry["seq_num"] - 1}
+        )
+        stale_error = clients[active].receive()
+        stale_retry = clients[active].receive()
+        self.assertEqual(stale_error["code"], "STALE_ACTION")
+        self.assertEqual(stale_retry["type"], "PRIORITY_GRANT")
+        self.assertEqual(stale_retry["seq_num"], retry["seq_num"])
+
+        clients[active].send(
+            {"type": "PRIORITY_PASS", "seq_num": stale_retry["seq_num"]}
+        )
+        next_grant = clients[other].receive()
+        self.assertEqual(next_grant["type"], "PRIORITY_GRANT")
+        self.assertGreater(next_grant["seq_num"], stale_retry["seq_num"])
 
     def test_unexpected_tcp_loss_awards_game_to_connected_player(self) -> None:
         self.server.reconnect_grace_seconds = 0.075

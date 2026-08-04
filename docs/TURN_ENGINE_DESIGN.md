@@ -17,9 +17,10 @@ At every supported priority window, the active player receives the first
 `PRIORITY_GRANT`. A valid `PRIORITY_PASS` transfers priority to the opponent.
 The second consecutive pass closes an empty-stack window and advances the
 phase. With a non-empty Stack it resolves exactly the top item, then grants the
-Active Player priority again. Each grant has its own request token, and stale or wrong-player passes
-leave phase state unchanged. An invalid pass by the current holder is followed
-by a fresh grant so the interactive client can retry.
+Active Player priority again. New grants have fresh request tokens, while stale
+or wrong-player passes leave phase state unchanged. Under Section 11, an
+invalid action by the current holder is followed by a retry grant carrying the
+same current token so the interactive client can try again.
 
 `PHASE_TRANSITION` into each combat decision step is the acting player's request
 token. Empty attacker declarations still skip directly to End of Combat;

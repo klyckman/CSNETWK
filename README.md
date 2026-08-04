@@ -17,7 +17,7 @@ effect and graphical interfaces are intentionally left as optional work.
 | Resilience | Complete | PING/PONG, priority deadlines, concession, 30-second reconnect grace, repeat games |
 | Submission package | Locally complete | README/PDF, diagrams, AI disclosure, test matrix; LAN and cross-group checks require external participants |
 
-The automated suite currently contains 110 tests and uses only Python's
+The automated suite currently contains 111 tests and uses only Python's
 standard library at runtime.
 
 ## Requirements
@@ -234,7 +234,9 @@ advance.
   are available; a later required draw from an empty library loses the game.
 - Each physical card instance ID may occur in only one submitted deck.
 - Each physical server-to-client PDU receives a distinct monotonically
-  increasing server sequence number, including separate broadcast copies.
+  increasing server sequence number, including separate broadcast copies. The
+  explicit Section 11 exception reissues the current token unchanged after a
+  rejected action while that player still holds priority.
 - Five spell effects and selected activated/triggered abilities are supported.
   Full behavior for every catalog card is optional bonus work and is not yet
   implemented.

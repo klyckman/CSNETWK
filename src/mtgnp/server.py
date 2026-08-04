@@ -190,6 +190,7 @@ class MTGNPServer:
                     pdu = session.connection.receive()
                 except PDUValidationError as exc:
                     self._send_error(session, exc.code, str(exc), {})
+                    self._retry_priority_after_error(session)
                     continue
                 self._dispatch(session, pdu)
         except (ConnectionClosed, ConnectionResetError, BrokenPipeError):
@@ -298,6 +299,7 @@ class MTGNPServer:
             f"{message_type.value} is not accepted while the server is in {current_phase}.",
             pdu,
         )
+        self._retry_priority_after_error(session, game)
 
     def _handle_player_ready(
         self, session: ClientSession, pdu: Mapping[str, Any]
@@ -490,11 +492,18 @@ class MTGNPServer:
         holder_seat = game.open_priority_window()
         self._send_priority_grant(game, holder_seat)
 
-    def _send_priority_grant(self, game: GameSession, seat_id: str) -> None:
+    def _send_priority_grant(
+        self,
+        game: GameSession,
+        seat_id: str,
+        *,
+        seq_num: int | None = None,
+    ) -> None:
         session = self._session_for_seat(seat_id)
         if session is None:
             return
-        seq_num = self._server_sequence()
+        if seq_num is None:
+            seq_num = self._server_sequence()
         game.record_priority_grant(seat_id, seq_num)
         try:
             session.connection.send(
@@ -508,6 +517,31 @@ class MTGNPServer:
             self._arm_priority_deadline(game, seat_id, seq_num)
         except (OSError, ConnectionClosed):
             session.connection.close()
+
+    def _retry_priority_grant(self, game: GameSession, seat_id: str) -> None:
+        """Reissue Section 11's unchanged token after a rejected action."""
+
+        seq_num = game.priority_token_for_seat(seat_id)
+        if seq_num is not None:
+            self._send_priority_grant(game, seat_id, seq_num=seq_num)
+
+    def _retry_priority_after_error(
+        self,
+        session: ClientSession,
+        game: GameSession | None = None,
+    ) -> None:
+        """Retry only a live, unpaused priority request owned by this client."""
+
+        current_game = self.game if game is None else game
+        if (
+            current_game is None
+            or current_game.lifecycle_state != LifecycleState.IN_GAME
+            or current_game.has_pending_triggers()
+            or self._game_has_reconnect_reservation(current_game)
+            or current_game.priority_holder_seat_id != session.seat_id
+        ):
+            return
+        self._retry_priority_grant(current_game, session.seat_id)
 
     def _arm_priority_deadline(
         self, game: GameSession, seat_id: str, seq_num: int
@@ -579,8 +613,7 @@ class MTGNPServer:
             )
         except GameRuleError as exc:
             self._send_error(session, exc.code, str(exc), pdu)
-            if game.priority_holder_seat_id == session.seat_id:
-                self._send_priority_grant(game, session.seat_id)
+            self._retry_priority_after_error(session, game)
             return
 
         if outcome == PriorityPassOutcome.GRANT_OPPONENT:
@@ -608,8 +641,7 @@ class MTGNPServer:
             game.apply_state_based_actions()
         except GameRuleError as exc:
             self._send_error(session, exc.code, str(exc), pdu)
-            if game.priority_holder_seat_id == session.seat_id:
-                self._send_priority_grant(game, session.seat_id)
+            self._retry_priority_after_error(session, game)
             return
 
         self._send_personalized_game_states(
@@ -639,8 +671,7 @@ class MTGNPServer:
             )
         except GameRuleError as exc:
             self._send_error(session, exc.code, str(exc), pdu)
-            if game.priority_holder_seat_id == session.seat_id:
-                self._send_priority_grant(game, session.seat_id)
+            self._retry_priority_after_error(session, game)
             return
 
         stack_item = game.visible_stack_item(item)
@@ -681,8 +712,7 @@ class MTGNPServer:
             )
         except GameRuleError as exc:
             self._send_error(session, exc.code, str(exc), pdu)
-            if game.priority_holder_seat_id == session.seat_id:
-                self._send_priority_grant(game, session.seat_id)
+            self._retry_priority_after_error(session, game)
             return
 
         stack_item = game.visible_stack_item(item)
@@ -717,6 +747,7 @@ class MTGNPServer:
                 "CONCEDE player_id must identify the sending player.",
                 pdu,
             )
+            self._retry_priority_after_error(session, game)
             return
         self._cancel_priority_deadline()
         game.declare_game_over(session.seat_id, "CONCEDE")

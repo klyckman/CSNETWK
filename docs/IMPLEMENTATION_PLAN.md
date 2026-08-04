@@ -57,9 +57,10 @@ instructor and then preserve in tests:
 1. **Server sequence numbers:** normative text says increment per PDU sent, but
    examples reuse a number across a broadcast or between a transition and a
    grant. Current code gives each physical server-to-client PDU its own number.
-2. **Error/retry sequencing:** the RFC both requires a monotonic server counter
-   and describes retrying with the same priority token. Current code sends a
-   fresh `PRIORITY_GRANT` after a rejected priority action.
+2. **Error/retry sequencing:** Section 11's specific retry rule takes precedence
+   over the general monotonic-counter rule. A rejected priority action receives
+   the current `PRIORITY_GRANT` again with the same `seq_num`; a successful
+   action or new priority holder receives a fresh server token.
 3. **Opening hand versus minimum deck:** legal deck size starts at one, while
    setup mandates drawing seven. Current code draws all available opening cards
    and loses only on a later required empty-library draw.
