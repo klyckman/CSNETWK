@@ -237,6 +237,10 @@ class ClientActionTests(unittest.TestCase):
                 "alice": {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0},
                 "bob": {"W": 0, "U": 1, "B": 1, "R": 0, "G": 0},
             },
+            "mana_pool": {
+                "alice": {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0},
+                "bob": {"W": 0, "U": 0, "B": 3, "R": 0, "G": 0},
+            },
             "hand": {"bob": ["swamp_001"]},
             "battlefield": {
                 "alice": [{"id": "mountain_001", "tapped": True}],
@@ -251,6 +255,8 @@ class ClientActionTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("mountain_001 [tapped]", rendered)
         self.assertIn("bob: U=1 | B=1", rendered)
+        self.assertIn("Mana pool:", rendered)
+        self.assertIn("bob: B=3", rendered)
         self.assertIn("Stack (bottom -> top):\n    (empty)", rendered)
         self.assertIn("bob: (empty)", rendered)
 

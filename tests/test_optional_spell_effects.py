@@ -55,17 +55,25 @@ def put_land_on_battlefield(game: GameSession, seat_id: str, card_id: str) -> No
 def put_creature_on_battlefield(
     game: GameSession, seat_id: str, card_id: str
 ) -> dict[str, object]:
+    return put_permanent_on_battlefield(game, seat_id, card_id)
+
+
+def put_permanent_on_battlefield(
+    game: GameSession, seat_id: str, card_id: str, *, tapped: bool = False
+) -> dict[str, object]:
     player = game.players[seat_id]
     player.hand.remove(card_id)
     definition = CATALOG.definition_for_instance(card_id)
-    permanent: dict[str, object] = {
-        "id": card_id,
-        "tapped": False,
-        "damage": 0,
-        "power": definition.power,
-        "toughness": definition.toughness,
-        "summoning_sick": False,
-    }
+    permanent: dict[str, object] = {"id": card_id, "tapped": tapped}
+    if definition.card_type in {"Creature", "Artifact Creature"}:
+        permanent.update(
+            {
+                "damage": 0,
+                "power": definition.power,
+                "toughness": definition.toughness,
+                "summoning_sick": False,
+            }
+        )
     player.battlefield.append(permanent)
     return permanent
 
@@ -368,6 +376,231 @@ class OptionalSpellEffectTests(unittest.TestCase):
                 mana_payment={"B": 1, "X": 1},
             )
         self.assertEqual(caught.exception.code, ErrorCode.ILLEGAL_TARGET)
+
+    def test_naturalize_and_terror_destroy_their_allowed_targets(self) -> None:
+        naturalize_game = ready_game(
+            (
+                "forest_001",
+                "island_001",
+                "naturalize_001",
+                "sol_ring_001",
+                "pacifism_001",
+            ),
+            ("island_002",),
+        )
+        put_permanent_on_battlefield(
+            naturalize_game, "seat_1", "forest_001"
+        )
+        put_permanent_on_battlefield(
+            naturalize_game, "seat_1", "island_001"
+        )
+        artifact = put_permanent_on_battlefield(
+            naturalize_game, "seat_1", "sol_ring_001"
+        )
+        _, artifact_resolution = cast_then_pass_twice(
+            naturalize_game,
+            "seat_1",
+            "naturalize_001",
+            ("sol_ring_001",),
+            {"G": 1, "X": 1},
+        )
+        self.assertEqual(
+            artifact_resolution.outcome, StackResolutionOutcome.RESOLVED
+        )
+        self.assertNotIn(artifact, naturalize_game.players["seat_1"].battlefield)
+        self.assertIn("sol_ring_001", naturalize_game.players["seat_1"].graveyard)
+
+        enchantment_game = ready_game(
+            (
+                "forest_001",
+                "island_001",
+                "naturalize_001",
+                "sol_ring_001",
+                "pacifism_001",
+            ),
+            ("island_002",),
+        )
+        put_permanent_on_battlefield(
+            enchantment_game, "seat_1", "forest_001"
+        )
+        put_permanent_on_battlefield(
+            enchantment_game, "seat_1", "island_001"
+        )
+        aura = put_permanent_on_battlefield(
+            enchantment_game, "seat_1", "pacifism_001"
+        )
+        _, aura_resolution = cast_then_pass_twice(
+            enchantment_game,
+            "seat_1",
+            "naturalize_001",
+            ("pacifism_001",),
+            {"G": 1, "X": 1},
+        )
+        self.assertEqual(aura_resolution.outcome, StackResolutionOutcome.RESOLVED)
+        self.assertNotIn(aura, enchantment_game.players["seat_1"].battlefield)
+        self.assertIn("pacifism_001", enchantment_game.players["seat_1"].graveyard)
+
+        terror_game = ready_game(
+            (
+                "swamp_001",
+                "swamp_002",
+                "terror_001",
+                "grizzly_bears_001",
+                "black_knight_001",
+            ),
+            ("grizzly_bears_002",),
+        )
+        put_permanent_on_battlefield(terror_game, "seat_1", "swamp_001")
+        put_permanent_on_battlefield(terror_game, "seat_1", "swamp_002")
+        creature = put_permanent_on_battlefield(
+            terror_game, "seat_2", "grizzly_bears_002"
+        )
+        _, terror_resolution = cast_then_pass_twice(
+            terror_game,
+            "seat_1",
+            "terror_001",
+            ("grizzly_bears_002",),
+            {"B": 1, "X": 1},
+        )
+        self.assertEqual(terror_resolution.outcome, StackResolutionOutcome.RESOLVED)
+        self.assertNotIn(creature, terror_game.players["seat_2"].battlefield)
+        self.assertIn("grizzly_bears_002", terror_game.players["seat_2"].graveyard)
+
+        illegal_game = ready_game(
+            (
+                "swamp_001",
+                "swamp_002",
+                "terror_001",
+                "grizzly_bears_001",
+                "black_knight_001",
+            ),
+            ("black_knight_002",),
+        )
+        put_permanent_on_battlefield(illegal_game, "seat_1", "swamp_001")
+        put_permanent_on_battlefield(illegal_game, "seat_1", "swamp_002")
+        put_permanent_on_battlefield(illegal_game, "seat_2", "black_knight_002")
+        illegal_game.record_priority_grant("seat_1", 10)
+        with self.assertRaises(GameRuleError) as caught:
+            illegal_game.process_cast_spell(
+                "seat_1",
+                seq_num=10,
+                card_id="terror_001",
+                targets=("black_knight_002",),
+                mana_payment={"B": 1, "X": 1},
+            )
+        self.assertEqual(caught.exception.code, ErrorCode.ILLEGAL_TARGET)
+
+    def test_raise_dead_rampant_growth_dark_ritual_and_incinerate(self) -> None:
+        raise_dead_game = ready_game(
+            ("swamp_001", "raise_dead_001", "black_knight_001"),
+            ("island_001",),
+        )
+        put_permanent_on_battlefield(raise_dead_game, "seat_1", "swamp_001")
+        raise_dead_game.players["seat_1"].hand.remove("black_knight_001")
+        raise_dead_game.players["seat_1"].graveyard.append("black_knight_001")
+        _, raise_dead_resolution = cast_then_pass_twice(
+            raise_dead_game,
+            "seat_1",
+            "raise_dead_001",
+            ("black_knight_001",),
+            {"B": 1},
+        )
+        self.assertEqual(raise_dead_resolution.outcome, StackResolutionOutcome.RESOLVED)
+        self.assertIn("black_knight_001", raise_dead_game.players["seat_1"].hand)
+        self.assertNotIn("black_knight_001", raise_dead_game.players["seat_1"].graveyard)
+
+        growth_game = ready_game(
+            ("forest_001", "rampant_growth_001", "mountain_001", "island_001"),
+            ("island_002",),
+        )
+        put_permanent_on_battlefield(growth_game, "seat_1", "forest_001")
+        put_permanent_on_battlefield(growth_game, "seat_1", "mountain_001")
+        growth_game.players["seat_1"].library = ["plains_001", "island_002"]
+        _, growth_resolution = cast_then_pass_twice(
+            growth_game,
+            "seat_1",
+            "rampant_growth_001",
+            (),
+            {"G": 1, "X": 1},
+        )
+        self.assertEqual(growth_resolution.outcome, StackResolutionOutcome.RESOLVED)
+        self.assertIn(
+            "plains_001",
+            [card["id"] for card in growth_game.players["seat_1"].battlefield],
+        )
+        tapped_land = next(
+            card
+            for card in growth_game.players["seat_1"].battlefield
+            if card["id"] == "plains_001"
+        )
+        self.assertTrue(tapped_land["tapped"])
+        self.assertEqual(growth_game.players["seat_1"].library, ["island_002"])
+
+        ritual_game = ready_game(
+            (
+                "swamp_001",
+                "dark_ritual_001",
+                "raise_dead_001",
+                "black_knight_001",
+            ),
+            ("island_001",),
+        )
+        put_permanent_on_battlefield(ritual_game, "seat_1", "swamp_001")
+        ritual_game.players["seat_1"].graveyard.append("black_knight_001")
+        _, ritual_resolution = cast_then_pass_twice(
+            ritual_game,
+            "seat_1",
+            "dark_ritual_001",
+            (),
+            {"B": 1},
+        )
+        self.assertEqual(ritual_resolution.outcome, StackResolutionOutcome.RESOLVED)
+        self.assertEqual(
+            ritual_game.visible_state("seat_1")["mana_pool"]["alice"]["B"], 3
+        )
+        ritual_game.open_priority_window()
+        ritual_game.record_priority_grant("seat_1", 20)
+        _, second_resolution = cast_then_pass_twice(
+            ritual_game,
+            "seat_1",
+            "raise_dead_001",
+            ("black_knight_001",),
+            {"B": 1},
+            first_seq=20,
+        )
+        self.assertEqual(second_resolution.outcome, StackResolutionOutcome.RESOLVED)
+        self.assertEqual(
+            ritual_game.visible_state("seat_1")["mana_pool"]["alice"]["B"], 2
+        )
+        self.assertIn("black_knight_001", ritual_game.players["seat_1"].hand)
+
+        incinerate_game = ready_game(
+            ("mountain_001", "mountain_002", "incinerate_001"),
+            ("grizzly_bears_002",),
+        )
+        put_permanent_on_battlefield(incinerate_game, "seat_1", "mountain_001")
+        put_permanent_on_battlefield(incinerate_game, "seat_1", "mountain_002")
+        target = put_creature_on_battlefield(
+            incinerate_game, "seat_2", "grizzly_bears_002"
+        )
+        _, incinerate_resolution = cast_then_pass_twice(
+            incinerate_game,
+            "seat_1",
+            "incinerate_001",
+            ("grizzly_bears_002",),
+            {"R": 1, "X": 1},
+        )
+        self.assertEqual(incinerate_resolution.outcome, StackResolutionOutcome.RESOLVED)
+        self.assertIn("grizzly_bears_002", incinerate_game.players["seat_2"].graveyard)
+        self.assertGreaterEqual(target["damage"], 3)
+        self.assertIn(
+            {
+                "change_type": "CANT_REGENERATE",
+                "target": "grizzly_bears_002",
+                "duration": "END_OF_TURN",
+            },
+            incinerate_resolution.state_changes,
+        )
 
 
 if __name__ == "__main__":

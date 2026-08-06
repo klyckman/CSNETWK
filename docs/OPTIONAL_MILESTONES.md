@@ -21,14 +21,14 @@ The rubric lists two optional categories:
 | Milestone | Scope | Acceptance gate | Status |
 | --- | --- | --- | --- |
 | O1A. Simple spell families | Data-driven spell registry; Shock, Lava Spike, Flame Slash, Searing Spear, Cancel, and Negate | Correct targets, timing, mana, Stack resolution, fizzle, protection, and atomic rejection tests | Implemented |
-| O1B. Zones and resources | Naturalize, Terror, Raise Dead, Rampant Growth, Dark Ritual, and Incinerate's regeneration restriction | Zone changes and mana changes are authoritative, visible, reversible only where rules allow, and tested over the network | Next |
+| O1B. Zones and resources | Naturalize, Terror, Raise Dead, Rampant Growth, Dark Ritual, and Incinerate's regeneration restriction | Zone changes and mana changes are authoritative, visible, reversible only where rules allow, and tested over the network | Implemented |
 | O1C. Choices and conditional resolution | Ponder, Mana Leak, Swords to Plowshares, Path to Exile, Healing Salve, and Mind Rot | Server-issued choices cannot leak hidden information; decline/pay/invalid-choice branches are tested | Planned |
 | O1D. Additional and alternative costs | Kicker for Goblin Bushwhacker and Vines of Vastwood, Madness for Reckless Wurm, Suspend for Rift Bolt | Costs and timing are declared in protocol-compatible fields and remain atomic | Planned |
 | O1E. Permanent and turn-wide rules | Merfolk Looter, Llanowar Elves, Elvish Mystic, Sol Ring, Troll Ascetic, Mother of Runes, Pacifism, Skullcrack, regeneration, and trample | Activated/static/continuous effects survive state updates and interact correctly with combat, targeting, and Cleanup | Planned |
 | O1F. Full-catalog closure | Audit all 58 definitions and 312 instances, including vanilla creatures, lands, and existing keywords/triggers | Every definition is classified as fully implemented; automated coverage matrix has no unsupported effect | Planned |
-| O2. Optional UI polish | Card-name/effect help, clearer choice prompts, supported-card view, and demonstration scripts | A new player can complete the demonstration without knowing instance IDs in advance | Planned |
-| O3. One creative client extension | Choose a read-only spectator/replay client or a graphical player client | Feature uses the authoritative server, reveals no hidden information, and is demonstrable on two machines | Planned after O1 |
-| O4. Bonus demonstration hardening | Scripted decks, feature checklist, clean-clone test, LAN run, and recorded interoperability evidence | Every claimed bonus can be reproduced and explained during checking | Planned |
+| O2. Optional UI polish | Card-name/effect help, clearer choice prompts, supported-card view, and demonstration scripts | A new player can complete the demonstration without knowing instance IDs in advance | In progress |
+| O3. One creative client extension | Choose a read-only spectator/replay client or a graphical player client | Feature uses the authoritative server, reveals no hidden information, and is demonstrable on two machines | In progress |
+| O4. Bonus demonstration hardening | Scripted decks, feature checklist, clean-clone test, LAN run, and recorded interoperability evidence | Every claimed bonus can be reproduced and explained during checking | In progress |
 
 ## O1A implementation record
 
@@ -53,6 +53,42 @@ battlefield before resolution, the spell fizzles and reports no state changes.
 The paired `decks/optional_spells_red.json` and
 `decks/optional_spells_blue.json` files provide an immediate manual
 demonstration of all six additions.
+
+## O1B implementation record
+
+O1B extends the same shared spell registry and game engine rules to cover zone
+movement and mana generation. The server now resolves the following cards
+authoritatively:
+
+- **Naturalize:** destroy target artifact or enchantment.
+- **Terror:** destroy target nonartifact, nonblack creature.
+- **Raise Dead:** return target creature card from your graveyard to your hand.
+- **Rampant Growth:** search your library for a basic land card, reveal it,
+  put it onto the battlefield tapped, then shuffle.
+- **Dark Ritual:** add three black mana to your mana pool.
+- **Incinerate:** deal three damage to any target and mark the damaged creature
+  so it cannot regenerate this turn.
+
+Mana can now float within a priority window and is spent before untapped lands,
+so resource-producing spells can pay for later actions in the same step. The
+client also renders the current mana pool so the hidden-authority state remains
+visible to players. Focused regression tests cover each of these behaviors.
+
+## O2-O4 graphical client record
+
+The GUI path is implemented as a Tkinter client in `src/mtgnp/gui_client.py`
+with an `mtgnp-gui` launcher. It keeps the authoritative server model intact
+while adding:
+
+- a live state pane and event log;
+- hand and battlefield inspectors with card-name/effect summaries;
+- one-click helpers for pass, concede, play land, cast, and activate;
+- modal prompts for mulligans, discard, trigger choices, and combat steps;
+- demo-friendly `--auto-keep` and `--auto-pass` flags; and
+- the same deck validation and reconnect behavior as the terminal client.
+
+This satisfies the GUI-oriented optional milestones without introducing a
+separate rules engine or hidden local state.
 
 ## Rules for every later optional slice
 

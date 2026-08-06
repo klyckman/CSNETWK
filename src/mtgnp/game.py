@@ -19,7 +19,7 @@ from .abilities import (
 from .catalog import CardCatalog, CardDefinition, CatalogError, MANA_COLORS
 from .lobby import ReadyPlayer
 from .protocol import ErrorCode, LifecycleState, TurnStep
-from .spells import SPELLS, SpellEffect, SpellTarget, spell_spec
+from .spells import SPELLS, SpellEffect, SpellSpec, SpellTarget, spell_spec
 from .triggers import (
     TRIGGERED_ABILITIES,
     TriggerEffect,
@@ -162,6 +162,9 @@ class PlayerGameState:
     hand: list[str] = field(default_factory=list)
     battlefield: list[dict[str, Any]] = field(default_factory=list)
     graveyard: list[str] = field(default_factory=list)
+    mana_pool: dict[str, int] = field(
+        default_factory=lambda: {color: 0 for color in MANA_COLORS}
+    )
     mulligans_taken: int = 0
     kept: bool = False
 
@@ -509,12 +512,8 @@ class GameSession:
             normalized_targets = self._validate_cast_targets(
                 card_id, definition, targets
             )
-            mana_sources = self._validate_mana_payment(
-                player, definition, mana_payment
-            )
+            self._validate_mana_payment(player, definition, mana_payment)
 
-            for permanent in mana_sources:
-                permanent["tapped"] = True
             player.hand.remove(card_id)
             item = StackItem(
                 stack_item_id=f"stk_{self._next_stack_item_number:04d}",
@@ -573,12 +572,10 @@ class GameSession:
             normalized_targets = self._validate_activated_ability_targets(
                 source_id, definition, ability, targets
             )
-            mana_sources = self._validate_ability_cost_payment(
+            self._validate_ability_cost_payment(
                 self._player(seat_id), definition, ability, cost_payment
             )
 
-            for permanent in mana_sources:
-                permanent["tapped"] = True
             if ability.tap_cost:
                 source["tapped"] = True
             item = StackItem(
@@ -900,6 +897,7 @@ class GameSession:
                     ) from exc
             previous = self.current_step
             self.current_step = next_step
+            self._empty_mana_pool()
             self._priority_passes = 0
             return previous, next_step
 
@@ -1473,6 +1471,7 @@ class GameSession:
             self.turn += 1
             self.current_step = TurnStep.UNTAP
             self.land_played_this_turn = False
+            self._empty_mana_pool()
             return previous_player, self.players[self.active_seat_id].player_id
 
     def declare_game_over(self, loser_seat_id: str, reason: str) -> None:
@@ -1508,6 +1507,10 @@ class GameSession:
                 },
                 "available_mana": {
                     player.player_id: self._available_mana_for_player(player)
+                    for player in self.players.values()
+                },
+                "mana_pool": {
+                    player.player_id: dict(player.mana_pool)
                     for player in self.players.values()
                 },
                 "hand": {viewer.player_id: list(viewer.hand)},
@@ -1580,6 +1583,11 @@ class GameSession:
                 available[mana_color] += 1
         return available
 
+    def _empty_mana_pool(self) -> None:
+        for player in self.players.values():
+            for color in MANA_COLORS:
+                player.mana_pool[color] = 0
+
     def _require_priority_action(self, seat_id: str, seq_num: int) -> None:
         if self.current_step not in PRIORITY_STEPS or self.priority_holder_seat_id is None:
             raise GameRuleError(
@@ -1612,6 +1620,40 @@ class GameSession:
             return self.catalog.definition_for_instance(card_id)
         except CatalogError as exc:
             raise GameRuleError(ErrorCode.ILLEGAL_ACTION, str(exc)) from exc
+
+    def _card_type_tokens(self, card_type: str) -> set[str]:
+        return {token for token in card_type.split() if token}
+
+    def _permanent_matches_spell_target(
+        self, permanent_id: str, spec: SpellSpec
+    ) -> bool:
+        definition = self._definition(permanent_id)
+        tokens = self._card_type_tokens(definition.card_type)
+        if spec.target_types and not tokens.intersection(spec.target_types):
+            return False
+        if spec.excluded_types and tokens.intersection(spec.excluded_types):
+            return False
+        if spec.excluded_color is not None and definition.color == spec.excluded_color:
+            return False
+        return True
+
+    def _graveyard_owner_for_card(self, card_id: str) -> str | None:
+        return next(
+            (
+                seat_id
+                for seat_id, player in self.players.items()
+                if card_id in player.graveyard
+            ),
+            None,
+        )
+
+    def _is_basic_land_card(self, card_id: str) -> bool:
+        definition = self._definition(card_id)
+        return (
+            definition.card_type == "Land"
+            and definition.subtype is not None
+            and definition.subtype.casefold().startswith("basic")
+        )
 
     def _validate_cast_targets(
         self,
@@ -1666,13 +1708,36 @@ class GameSession:
                     ErrorCode.ILLEGAL_TARGET,
                     f"{definition.name} must target a creature.",
                 )
-            if (
-                spec.excluded_color is not None
-                and self._definition(target).color == spec.excluded_color
-            ):
+            if spec.excluded_color is not None and self._definition(target).color == spec.excluded_color:
                 raise GameRuleError(
                     ErrorCode.ILLEGAL_TARGET,
                     f"{definition.name} cannot target that creature's color.",
+                )
+        elif spec.target == SpellTarget.PERMANENT:
+            if located is None:
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_TARGET,
+                    f"{definition.name} must target a permanent on the battlefield.",
+                )
+            if not self._permanent_matches_spell_target(target, spec):
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_TARGET,
+                    f"{definition.name} cannot target that permanent.",
+                )
+        elif spec.target == SpellTarget.GRAVEYARD_CREATURE:
+            graveyard_owner = self._graveyard_owner_for_card(target)
+            if graveyard_owner is None:
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_TARGET,
+                    f"{definition.name} must target a creature card in a graveyard.",
+                )
+            if self._definition(target).card_type not in {
+                "Creature",
+                "Artifact Creature",
+            }:
+                raise GameRuleError(
+                    ErrorCode.ILLEGAL_TARGET,
+                    f"{definition.name} must target a creature card in a graveyard.",
                 )
         elif spec.target in {SpellTarget.SPELL, SpellTarget.NONCREATURE_SPELL}:
             target_item = next(
@@ -1694,7 +1759,7 @@ class GameSession:
                         f"{definition.name} cannot target a creature spell.",
                     )
 
-        if creature and self._target_has_protection_from_source(card_id, target):
+        if located is not None and self._target_has_protection_from_source(card_id, target):
             raise GameRuleError(
                 ErrorCode.ILLEGAL_TARGET,
                 f"{target} has protection from {definition.name}.",
@@ -1865,8 +1930,14 @@ class GameSession:
 
         selected: list[dict[str, Any]] = []
         used_ids: set[str] = set()
+        pool_spend = {color: 0 for color in MANA_COLORS}
+
         for color in MANA_COLORS:
             required = expected.get(color, 0)
+            from_pool = min(required, player.mana_pool.get(color, 0))
+            if from_pool:
+                pool_spend[color] = from_pool
+                required -= from_pool
             matching = [
                 permanent
                 for permanent, produced in available
@@ -1882,6 +1953,13 @@ class GameSession:
                 used_ids.add(permanent["id"])
 
         generic_required = expected.get("X", 0)
+        for color in MANA_COLORS:
+            if generic_required <= 0:
+                break
+            from_pool = min(generic_required, player.mana_pool.get(color, 0) - pool_spend[color])
+            if from_pool:
+                pool_spend[color] += from_pool
+                generic_required -= from_pool
         generic_sources = [
             permanent
             for permanent, _ in available
@@ -1893,6 +1971,11 @@ class GameSession:
                 f"Not enough untapped mana sources for {action_name}'s generic cost.",
             )
         selected.extend(generic_sources[:generic_required])
+        for color, amount in pool_spend.items():
+            if amount:
+                player.mana_pool[color] -= amount
+        for permanent in selected:
+            permanent["tapped"] = True
         return selected
 
     def _apply_spell_effect(
@@ -1931,9 +2014,7 @@ class GameSession:
         spec = spell_spec(definition.base_id)
         if spec is None:
             return False
-        if spec.target == SpellTarget.NONE:
-            return False
-        target = item.targets[0]
+        target = item.targets[0] if item.targets else ""
 
         if spec.effect == SpellEffect.DAMAGE:
             player_seat = self._seat_for_player_id(target)
@@ -1951,11 +2032,19 @@ class GameSession:
             changes.append(
                 {"change_type": "DAMAGE", "target": target, "amount": spec.amount}
             )
+            if spec.prevent_regeneration:
+                changes.append(
+                    {
+                        "change_type": "CANT_REGENERATE",
+                        "target": target,
+                        "duration": "END_OF_TURN",
+                    }
+                )
             return True
 
         if spec.effect == SpellEffect.RETURN_TO_HAND:
             located = self._find_permanent(target)
-            if located is None or not self._is_creature_permanent(located[1]):
+            if located is None:
                 return False
             if self._target_has_protection_from_source(item.source_id, target):
                 return False
@@ -1992,13 +2081,69 @@ class GameSession:
             )
             return True
 
+        if spec.effect == SpellEffect.RETURN_FROM_GRAVEYARD:
+            owner_seat = self._graveyard_owner_for_card(target)
+            if owner_seat is None:
+                return False
+            if self._definition(target).card_type not in {
+                "Creature",
+                "Artifact Creature",
+            }:
+                return False
+            owner = self.players[owner_seat]
+            owner.graveyard.remove(target)
+            owner.hand.append(target)
+            changes.append({"change_type": "RETURN_TO_HAND", "target": target, "from": "GRAVEYARD"})
+            return True
+
+        if spec.effect == SpellEffect.SEARCH_LIBRARY:
+            controller = self.players[item.controller_seat_id]
+            basic_land = next(
+                (card_id for card_id in controller.library if self._is_basic_land_card(card_id)),
+                None,
+            )
+            if basic_land is not None:
+                controller.library.remove(basic_land)
+                controller.battlefield.append({"id": basic_land, "tapped": True})
+                changes.append(
+                    {
+                        "change_type": "PUT_ONTO_BATTLEFIELD_TAPPED",
+                        "target": basic_land,
+                    }
+                )
+            self._random.shuffle(controller.library)
+            changes.append(
+                {
+                    "change_type": "SEARCH_LIBRARY",
+                    "target": self.player_id_for_seat(item.controller_seat_id),
+                    "card_id": basic_land,
+                    "shuffled": True,
+                }
+            )
+            return True
+
+        if spec.effect == SpellEffect.ADD_MANA:
+            controller = self.players[item.controller_seat_id]
+            for color, amount in spec.mana_addition.items():
+                controller.mana_pool[color] = controller.mana_pool.get(color, 0) + amount
+            changes.append(
+                {
+                    "change_type": "ADD_MANA",
+                    "target": self.player_id_for_seat(item.controller_seat_id),
+                    "mana": dict(spec.mana_addition),
+                }
+            )
+            return True
+
         located = self._find_permanent(target)
-        if located is None or not self._is_creature_permanent(located[1]):
+        if located is None:
             return False
         if self._target_has_protection_from_source(item.source_id, target):
             return False
         owner_seat, permanent = located
         if spec.effect == SpellEffect.MODIFY_STATS:
+            if not self._is_creature_permanent(permanent):
+                return False
             permanent["power"] = int(permanent["power"]) + spec.power
             permanent["toughness"] = int(permanent["toughness"]) + spec.toughness
             changes.append(

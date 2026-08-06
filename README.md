@@ -3,7 +3,8 @@
 MTGNP is a two-player, server-authoritative implementation of the Magic: The
 Gathering Multiplayer Network Protocol v1.0 for CSNETWK. The required base
 protocol and gameplay milestones are implemented. Optional full-card-effect
-coverage is now in progress; graphical interfaces remain later optional work.
+coverage is now in progress, and a Tk graphical client is available for the
+bonus GUI path.
 
 ## Base milestone status
 
@@ -17,7 +18,7 @@ coverage is now in progress; graphical interfaces remain later optional work.
 | Resilience | Complete | PING/PONG, priority deadlines, concession, 30-second reconnect grace, repeat games |
 | Submission package | Locally complete | README/PDF, diagrams, AI disclosure, test matrix; LAN and cross-group checks require external participants |
 
-The automated suite currently contains 120 tests and uses only Python's
+The automated suite currently contains 125 tests and uses only Python's
 standard library at runtime.
 
 ## Optional milestone status
@@ -25,9 +26,9 @@ standard library at runtime.
 | Milestone | Status | Result |
 | --- | --- | --- |
 | O1A. Simple spell families | Complete | Declarative spell rules plus Shock, Lava Spike, Flame Slash, Searing Spear, Cancel, and Negate |
-| O1B. Zones and resources | Next | Naturalize, Terror, Raise Dead, Rampant Growth, Dark Ritual, and Incinerate |
+| O1B. Zones and resources | Complete | Naturalize, Terror, Raise Dead, Rampant Growth, Dark Ritual, and Incinerate |
 | O1C-O1F. Full catalog closure | Planned | Choices, special costs, permanent effects, then a 58-card coverage audit |
-| O2-O4. Creative features and demo | Planned | UI polish, one spectator/replay or GUI extension, and bonus demonstration hardening |
+| O2-O4. Creative features and demo | In progress | Tk GUI client, card/help polish, and demo-oriented launch commands |
 
 The detailed order, card grouping, and acceptance gates are in
 `docs/OPTIONAL_MILESTONES.md`.
@@ -54,8 +55,9 @@ An editable install is optional:
 python -m pip install -e .
 ```
 
-After an editable install, `mtgnp-server` and `mtgnp-client` may be used in
-place of `python -m mtgnp.server` and `python -m mtgnp.client`.
+After an editable install, `mtgnp-server`, `mtgnp-client`, and `mtgnp-gui` may
+be used in place of `python -m mtgnp.server`, `python -m mtgnp.client`, and
+`python -m mtgnp.gui_client`.
 
 ### Regenerate the submission PDF
 
@@ -95,6 +97,12 @@ Start player 2:
 
 ```powershell
 python -m mtgnp.client --player-id bob --deck decks/stack_demo_blue_black.json --auto-keep --verbose
+```
+
+For the graphical client, use the same deck and connection arguments:
+
+```powershell
+mtgnp-gui --player-id alice --deck decks/stack_demo_red_green.json --auto-keep
 ```
 
 `--verbose` is the required demo mode. It prints every complete PDU sent and

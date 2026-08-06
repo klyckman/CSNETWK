@@ -354,6 +354,17 @@ class MTGNPClient:
             raise received
         return received
 
+    def poll(self) -> dict[str, Any] | None:
+        if self._receiver_thread is None:
+            raise RuntimeError("poll() requires start_heartbeat() to be running.")
+        try:
+            received = self._incoming.get_nowait()
+        except queue.Empty:
+            return None
+        if isinstance(received, Exception):
+            raise received
+        return received
+
     def close(self) -> None:
         self._heartbeat_stop.set()
         self._pong_received.set()
@@ -411,6 +422,11 @@ def _render_game_state(state: dict[str, Any]) -> None:
     if available_mana:
         print("  Available mana (untapped basic lands):")
         for player_id, mana in available_mana.items():
+            print(f"    {player_id}: {_format_available_mana(mana)}")
+    mana_pool = state.get("mana_pool", {})
+    if mana_pool and any(any(amount for amount in pool.values()) for pool in mana_pool.values()):
+        print("  Mana pool:")
+        for player_id, mana in mana_pool.items():
             print(f"    {player_id}: {_format_available_mana(mana)}")
     print(f"  Your hand ({len(own_hand)}): {own_hand}")
     print("  Battlefield:")

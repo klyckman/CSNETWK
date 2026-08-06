@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Mapping
@@ -15,6 +15,8 @@ class SpellTarget(StrEnum):
     ANY = "ANY"
     PLAYER = "PLAYER"
     CREATURE = "CREATURE"
+    PERMANENT = "PERMANENT"
+    GRAVEYARD_CREATURE = "GRAVEYARD_CREATURE"
     SPELL = "SPELL"
     NONCREATURE_SPELL = "NONCREATURE_SPELL"
 
@@ -27,6 +29,9 @@ class SpellEffect(StrEnum):
     COUNTER = "COUNTER"
     MODIFY_STATS = "MODIFY_STATS"
     DESTROY = "DESTROY"
+    SEARCH_LIBRARY = "SEARCH_LIBRARY"
+    ADD_MANA = "ADD_MANA"
+    RETURN_FROM_GRAVEYARD = "RETURN_FROM_GRAVEYARD"
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +44,12 @@ class SpellSpec:
     power: int = 0
     toughness: int = 0
     excluded_color: str | None = None
+    target_types: frozenset[str] = frozenset()
+    excluded_types: frozenset[str] = frozenset()
+    mana_addition: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    prevent_regeneration: bool = False
 
 
 SPELLS: Mapping[str, SpellSpec] = MappingProxyType(
@@ -77,6 +88,38 @@ SPELLS: Mapping[str, SpellSpec] = MappingProxyType(
             SpellTarget.CREATURE,
             SpellEffect.DESTROY,
             excluded_color="B",
+        ),
+        # O1B zone and resource spells.
+        "naturalize": SpellSpec(
+            SpellTarget.PERMANENT,
+            SpellEffect.DESTROY,
+            target_types=frozenset({"Artifact", "Enchantment"}),
+        ),
+        "terror": SpellSpec(
+            SpellTarget.PERMANENT,
+            SpellEffect.DESTROY,
+            excluded_color="B",
+            target_types=frozenset({"Creature"}),
+            excluded_types=frozenset({"Artifact"}),
+        ),
+        "raise_dead": SpellSpec(
+            SpellTarget.GRAVEYARD_CREATURE,
+            SpellEffect.RETURN_FROM_GRAVEYARD,
+        ),
+        "rampant_growth": SpellSpec(
+            SpellTarget.NONE,
+            SpellEffect.SEARCH_LIBRARY,
+        ),
+        "dark_ritual": SpellSpec(
+            SpellTarget.NONE,
+            SpellEffect.ADD_MANA,
+            mana_addition=MappingProxyType({"B": 3}),
+        ),
+        "incinerate": SpellSpec(
+            SpellTarget.ANY,
+            SpellEffect.DAMAGE,
+            amount=3,
+            prevent_regeneration=True,
         ),
     }
 )
