@@ -87,8 +87,12 @@ python -m mtgnp.client --player-id bob --deck decks/stack_demo_blue_black.json -
 
 `--verbose` is the required demo mode. It prints every complete PDU sent and
 received with direction, peer, type, sequence number, timestamp, and formatted
-JSON. Remove the flag for normal play. Add `--auto-pass` to both clients for an
-unattended protocol smoke test.
+JSON. PING and PONG retain every field but use one compact line each. During
+interactive verbose play, each heartbeat pair is separated from gameplay by a
+client-side `+` border. A matched PONG is followed by a one-line game-context
+summary and a restored input prompt so background heartbeat output does not
+obscure the current phase. Remove the flag for normal play. Add `--auto-pass`
+to both clients for an unattended protocol smoke test.
 
 For a LAN game, run the server on one computer, allow inbound TCP port 4444 in
 the host firewall, determine the host's LAN IPv4 address, and give both clients

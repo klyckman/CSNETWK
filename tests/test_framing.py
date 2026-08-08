@@ -119,7 +119,8 @@ class FramingTests(unittest.TestCase):
         trace = output.getvalue()
         self.assertIn("SEND C->S peer=server type=PING seq_num=9", trace)
         self.assertIn("RECEIVE C->S peer=client type=PING seq_num=9", trace)
-        self.assertEqual(trace.count('"type": "PING"'), 2)
+        self.assertEqual(trace.count("timestamp=4321"), 2)
+        self.assertEqual(len(trace.splitlines()), 2)
 
     def test_closed_wrapper_refuses_further_operations(self) -> None:
         left, right = socket.socketpair()

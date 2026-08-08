@@ -31,10 +31,14 @@ class PDUTracer:
         enabled: bool = False,
         stream: TextIO | None = None,
         timestamp: Callable[[], str] | None = None,
+        leading_newline: bool = False,
+        heartbeat_border: str | None = None,
     ) -> None:
         self._enabled = enabled
         self._stream = stream if stream is not None else sys.stdout
         self._timestamp = timestamp if timestamp is not None else self._now
+        self._leading_newline = leading_newline
+        self._heartbeat_border = heartbeat_border
         self._lock = threading.RLock()
 
     @staticmethod
@@ -74,6 +78,36 @@ class PDUTracer:
                 f"[{self._timestamp()}] {action.value} {wire_direction}"
                 f"{peer_label} type={pdu_type} seq_num={seq_num}"
             )
-            formatted = json.dumps(pdu, ensure_ascii=False, indent=2, sort_keys=True)
-            print(f"{header}\n{formatted}", file=self._stream, flush=True)
+            prefix = "\n" if self._leading_newline else ""
+            if pdu_type in {"PING", "PONG"}:
+                extra_fields = " ".join(
+                    f"{key}={json.dumps(pdu[key], ensure_ascii=False)}"
+                    for key in sorted(pdu)
+                    if key not in {"type", "seq_num"}
+                )
+                suffix = f" {extra_fields}" if extra_fields else ""
+                if self._heartbeat_border is not None:
+                    if pdu_type == "PING":
+                        print(
+                            f"{prefix}\n{self._heartbeat_border}\n"
+                            f"{header}{suffix}",
+                            file=self._stream,
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"{prefix}{header}{suffix}\n"
+                            f"{self._heartbeat_border}\n",
+                            file=self._stream,
+                            flush=True,
+                        )
+                    return
+                print(
+                    f"{prefix}{header}{suffix}",
+                    file=self._stream,
+                    flush=True,
+                )
+                return
 
+            formatted = json.dumps(pdu, ensure_ascii=False, indent=2, sort_keys=True)
+            print(f"{prefix}{header}\n{formatted}", file=self._stream, flush=True)
