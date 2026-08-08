@@ -20,6 +20,30 @@ def wait_for(predicate, timeout: float = 1.0) -> bool:
 
 
 class ClientHeartbeatTests(unittest.TestCase):
+    def test_matching_verbose_pong_restores_gameplay_context(self) -> None:
+        client = MTGNPClient(verbose=True)
+        rendered = []
+        client.set_heartbeat_resume_renderer(lambda: rendered.append("resume"))
+        client._pending_ping = (7, 1000)
+
+        client._record_pong(
+            {"type": "PONG", "seq_num": 7, "timestamp": 1000}
+        )
+
+        self.assertEqual(rendered, ["resume"])
+
+    def test_unmatched_pong_does_not_restore_gameplay_context(self) -> None:
+        client = MTGNPClient(verbose=True)
+        rendered = []
+        client.set_heartbeat_resume_renderer(lambda: rendered.append("resume"))
+        client._pending_ping = (7, 1000)
+
+        client._record_pong(
+            {"type": "PONG", "seq_num": 8, "timestamp": 1000}
+        )
+
+        self.assertEqual(rendered, [])
+
     def test_background_receiver_matches_pong_while_main_thread_is_idle(self) -> None:
         client_socket, server_socket = socket.socketpair()
         client = MTGNPClient()

@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .abilities import ACTIVATED_ABILITIES, activated_ability
 from .catalog import CardCatalog, CatalogError, MANA_COLORS, load_catalog
@@ -26,6 +26,45 @@ DEFAULT_DATA_DIRECTORY = Path(__file__).resolve().parents[2] / "data"
 DISPLAY_WIDTH = 78
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
 DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 10.0
+
+
+class _PromptTracker:
+    """Remember the active interactive prompt so background output can restore it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._active_prompt: str | None = None
+
+    def read(self, prompt: str) -> str:
+        with self._lock:
+            self._active_prompt = prompt
+        try:
+            return input(prompt)
+        finally:
+            with self._lock:
+                if self._active_prompt == prompt:
+                    self._active_prompt = None
+
+    def redraw(self) -> None:
+        with self._lock:
+            prompt = self._active_prompt
+        if prompt is None:
+            return
+        label = prompt.rstrip()
+        if label.endswith(":"):
+            label = label[:-1]
+        print(
+            f"{label} (continue; existing input is preserved): ",
+            end="",
+            flush=True,
+        )
+
+
+_PROMPT_TRACKER = _PromptTracker()
+
+
+def _read_input(prompt: str) -> str:
+    return _PROMPT_TRACKER.read(prompt)
 
 
 def load_deck_file(path: str | Path, catalog: CardCatalog) -> tuple[str, ...]:
@@ -52,7 +91,11 @@ class MTGNPClient:
     ) -> None:
         self.host = host
         self.port = port
-        self.tracer = PDUTracer(enabled=verbose)
+        self.tracer = PDUTracer(
+            enabled=verbose,
+            leading_newline=True,
+            heartbeat_border="+" * DISPLAY_WIDTH,
+        )
         self.connection: FramedConnection | None = None
         self._sequence = 1
         self._sequence_lock = threading.Lock()
@@ -65,6 +108,7 @@ class MTGNPClient:
         self._heartbeat_thread: threading.Thread | None = None
         self._receiver_thread: threading.Thread | None = None
         self._incoming: queue.Queue[dict[str, Any] | Exception] = queue.Queue()
+        self._heartbeat_resume_renderer: Callable[[], None] | None = None
 
     def connect(self) -> None:
         stream = socket.create_connection((self.host, self.port))
@@ -77,6 +121,13 @@ class MTGNPClient:
 
     def set_verbose(self, enabled: bool) -> None:
         self.tracer.set_enabled(enabled)
+
+    def set_heartbeat_resume_renderer(
+        self, renderer: Callable[[], None] | None
+    ) -> None:
+        """Set the UI callback run after a verbose, matching PONG is received."""
+
+        self._heartbeat_resume_renderer = renderer
 
     def _next_client_sequence(self) -> int:
         with self._sequence_lock:
@@ -172,10 +223,16 @@ class MTGNPClient:
                 return
 
     def _record_pong(self, pdu: dict[str, Any]) -> None:
+        matched = False
         with self._heartbeat_lock:
             if self._pending_ping == (pdu["seq_num"], pdu["timestamp"]):
                 self._pending_ping = None
                 self._pong_received.set()
+                matched = True
+        if matched and self.tracer.enabled:
+            renderer = self._heartbeat_resume_renderer
+            if renderer is not None:
+                renderer()
 
     def _fail_heartbeat(self) -> None:
         self._heartbeat_failed.set()
@@ -474,6 +531,35 @@ def _state_after_phase_transition(
     return updated
 
 
+def _render_heartbeat_resume(
+    state: dict[str, Any] | None, player_id: str
+) -> None:
+    """Restore concise gameplay context after verbose heartbeat output."""
+
+    if state is None:
+        print("[GAME] Waiting for the first authoritative game-state update.")
+    elif state.get("phase") == "LOBBY":
+        print(
+            "[GAME] Phase: LOBBY | "
+            f"{state.get('players_connected', 0)}/2 connected | "
+            f"{state.get('players_ready', 0)}/2 ready"
+        )
+    else:
+        parts = [
+            f"Turn {state.get('turn', '?')}",
+            f"Phase: {state.get('phase', 'UNKNOWN')}",
+            f"Owner: {state.get('active_player', 'unknown')}",
+        ]
+        own_mana = state.get("available_mana", {}).get(player_id)
+        if own_mana is not None:
+            parts.append(f"Mana: {_format_available_mana(own_mana)}")
+        stack = state.get("stack", [])
+        stack_summary = "empty" if not stack else f"{len(stack)} item(s)"
+        parts.append(f"Stack: {stack_summary}")
+        print("[GAME] " + " | ".join(parts))
+    _PROMPT_TRACKER.redraw()
+
+
 def _render_pdu(pdu: dict[str, Any]) -> None:
     message_type = MessageType(pdu["type"])
     if message_type == MessageType.GAME_STATE_UPDATE:
@@ -579,7 +665,8 @@ def _render_pdu(pdu: dict[str, Any]) -> None:
         )
         return
     if message_type == MessageType.PONG:
-        print(f"PONG received for timestamp {pdu['timestamp']}")
+        # Verbose tracing already displays the complete PONG. In normal mode a
+        # successful heartbeat is intentionally silent.
         return
     if message_type == MessageType.GAME_OVER:
         print("\n" + "=" * DISPLAY_WIDTH)
@@ -649,7 +736,7 @@ def _choose_mulligan(
         return True, hand[:mulligans_taken]
 
     while True:
-        choice = input("Keep this hand or mulligan? [k/m]: ").strip().lower()
+        choice = _read_input("Keep this hand or mulligan? [k/m]: ").strip().lower()
         if choice in {"m", "mulligan"}:
             return False, ()
         if choice not in {"k", "keep"}:
@@ -662,7 +749,7 @@ def _choose_mulligan(
             f"Choose exactly {mulligans_taken} card(s) from your hand to put "
             "on the bottom of the library."
         )
-        selected = tuple(input("Card IDs, separated by spaces: ").split())
+        selected = tuple(_read_input("Card IDs, separated by spaces: ").split())
         if len(selected) != mulligans_taken:
             print(f"Exactly {mulligans_taken} card ID(s) are required.")
             continue
@@ -684,7 +771,7 @@ def _choose_cleanup_discard(
 
     while True:
         print(f"Cleanup requires discarding exactly {excess} card(s): {list(hand)}")
-        selected = tuple(input("Card IDs, separated by spaces: ").split())
+        selected = tuple(_read_input("Card IDs, separated by spaces: ").split())
         if len(selected) != excess:
             print(f"Exactly {excess} card ID(s) are required.")
             continue
@@ -915,7 +1002,7 @@ def _choose_priority_action(
     )
     print("Mana is inferred from the catalog; add --mana R=1,X=1 to override.")
     while True:
-        command = input("Action: ")
+        command = _read_input("Action: ")
         try:
             action, fields = _parse_priority_action(command, catalog)
         except (ValueError, CatalogError) as exc:
@@ -1042,7 +1129,7 @@ def _choose_attackers(
     target = _opposing_player_id(state, player_id)
     print(f"Eligible attackers: {list(eligible)}")
     while True:
-        command = input("Attacker IDs separated by spaces, or 'none': ")
+        command = _read_input("Attacker IDs separated by spaces, or 'none': ")
         try:
             return _parse_attacker_declaration(command, eligible, target)
         except ValueError as exc:
@@ -1067,7 +1154,7 @@ def _choose_blockers(
     print(f"Attackers: {list(attacker_ids)}")
     print(f"Eligible blockers: {list(eligible)}")
     while True:
-        command = input(
+        command = _read_input(
             "Blocks as BLOCKER_ID=ATTACKER_ID pairs, or 'none': "
         )
         try:
@@ -1093,7 +1180,7 @@ def _choose_damage_orders(
         else:
             print(f"Choose damage order for {attacker_id}: {blockers}")
             while True:
-                command = input("Blocker IDs from first damaged to last: ")
+                command = _read_input("Blocker IDs from first damaged to last: ")
                 try:
                     order = _parse_damage_order(command, blockers)
                     break
@@ -1111,7 +1198,7 @@ def _choose_trigger_order(
         return trigger_ids
     print("Enter every trigger ID from Stack bottom to Stack top.")
     while True:
-        selected = tuple(shlex.split(input("Trigger order: ")))
+        selected = tuple(shlex.split(_read_input("Trigger order: ")))
         if len(set(selected)) == len(selected) and set(selected) == set(trigger_ids):
             return selected
         print(f"\nList every trigger exactly once: {list(trigger_ids)}.\n")
@@ -1124,7 +1211,9 @@ def _choose_trigger_choice(
     legal_targets = tuple(pdu["legal_targets"])
     if optional and not automatic:
         while True:
-            answer = input("Use this optional triggered ability? [y/n]: ").strip().lower()
+            answer = _read_input(
+                "Use this optional triggered ability? [y/n]: "
+            ).strip().lower()
             if answer in {"n", "no"}:
                 return False, None
             if answer in {"y", "yes"}:
@@ -1134,7 +1223,7 @@ def _choose_trigger_choice(
         if automatic:
             return True, legal_targets[0]
         while True:
-            target = input("Choose trigger target: ").strip()
+            target = _read_input("Choose trigger target: ").strip()
             if target in legal_targets:
                 return True, target
             print(f"\nChoose one legal target from {list(legal_targets)}.\n")
@@ -1153,6 +1242,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     client = MTGNPClient(host=args.host, port=args.port, verbose=args.verbose)
     latest_state: dict[str, Any] | None = None
     ready_after_game_over = False
+    client.set_heartbeat_resume_renderer(
+        lambda: _render_heartbeat_resume(latest_state, args.player_id)
+    )
     try:
         client.connect()
         client.start_heartbeat(

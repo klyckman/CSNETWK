@@ -17,6 +17,7 @@ from mtgnp.client import (
     _priority_role_message,
     _render_action_submission,
     _render_game_state,
+    _render_heartbeat_resume,
     _render_pdu,
     _state_after_phase_transition,
 )
@@ -123,6 +124,34 @@ class ClientActionTests(unittest.TestCase):
         self.assertIn("response priority", response)
         self.assertIn("not the start of your turn", response)
         self.assertIn("This is your turn", _priority_role_message(state, "alice"))
+
+    def test_heartbeat_resume_reprints_authoritative_gameplay_context(self) -> None:
+        state = {
+            "turn": 3,
+            "phase": "PRECOMBAT_MAIN",
+            "active_player": "bob",
+            "available_mana": {"bob": {"B": 1}},
+            "stack": [],
+        }
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            _render_heartbeat_resume(state, "bob")
+
+        rendered = output.getvalue()
+        self.assertEqual(
+            rendered,
+            "[GAME] Turn 3 | Phase: PRECOMBAT_MAIN | Owner: bob | "
+            "Mana: B=1 | Stack: empty\n",
+        )
+
+    def test_successful_pong_is_silent_outside_verbose_trace(self) -> None:
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            _render_pdu({"type": "PONG", "seq_num": 1, "timestamp": 1000})
+
+        self.assertEqual(output.getvalue(), "")
 
     def test_combat_declaration_parsers_build_protocol_shapes(self) -> None:
         self.assertEqual(
