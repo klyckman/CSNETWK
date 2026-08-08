@@ -74,21 +74,23 @@ so resource-producing spells can pay for later actions in the same step. The
 client also renders the current mana pool so the hidden-authority state remains
 visible to players. Focused regression tests cover each of these behaviors.
 
-## O2-O4 graphical client record
+## O3 implementation record
 
-The GUI path is implemented as a Tkinter client in `src/mtgnp/gui_client.py`
-with an `mtgnp-gui` launcher. It keeps the authoritative server model intact
-while adding:
+O3 adds a read-only spectator client for observing an active MTGNP game. The
+spectator client connects to the authoritative server without occupying a player
+seat and receives the same shared game information available to spectators.
 
-- a live state pane and event log;
-- hand and battlefield inspectors with card-name/effect summaries;
-- one-click helpers for pass, concede, play land, cast, and activate;
-- modal prompts for mulligans, discard, trigger choices, and combat steps;
-- demo-friendly `--auto-keep` and `--auto-pass` flags; and
-- the same deck validation and reconnect behavior as the terminal client.
+The client renders the current lobby or game state, including the battlefield,
+visible cards, life totals, mana information, turn and phase, Stack activity,
+combat events, trigger activity, and game-over results. It updates its display
+from server-issued state and protocol messages rather than implementing or
+resolving game rules locally.
 
-This satisfies the GUI-oriented optional milestones without introducing a
-separate rules engine or hidden local state.
+The spectator client is strictly read-only. It does not send game actions, 
+make player choices, receive hidden player information, or modify the game state.
+The server explicitly assigns the spectator role and rejects non-PING messages
+from spectator clients, preserving the server-authoritative architecture and
+preventing spectators from affecting an ongoing match.
 
 ## Rules for every later optional slice
 

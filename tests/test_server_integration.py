@@ -156,6 +156,38 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(update_for_bob["state"]["players_ready"], 1)
         self.assertEqual(update_for_bob["state"]["waiting_for"], ["seat_2"])
 
+    def test_accepts_spectator_as_third_connection_and_refuses_fourth(self) -> None:
+        player_1 = self.connect_client("server-for-alice")
+        player_2 = self.connect_client("server-for-bob")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 2))
+
+        spectator = self.connect_client("server-for-spectator")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 3))
+        spectator_update = spectator.receive()
+        self.assertEqual(spectator_update["type"], "GAME_STATE_UPDATE")
+        self.assertEqual(spectator_update["state"]["players_connected"], 2)
+
+        spectator.send({"type": "PING", "seq_num": 1, "timestamp": 111})
+        spectator_pong = spectator.receive()
+        self.assertEqual(spectator_pong["type"], "PONG")
+
+        spectator.send(
+            {
+                "type": "PLAYER_READY",
+                "seq_num": 2,
+                "player_id": "charlie",
+                "deck_list": ["swamp_001"],
+            }
+        )
+        spectator_error = spectator.receive()
+        self.assertEqual(spectator_error["type"], "ERROR")
+        self.assertEqual(spectator_error["code"], "ILLEGAL_ACTION")
+
+        fourth = socket.create_connection(("127.0.0.1", self.server.bound_port))
+        fourth.settimeout(2)
+        self.assertEqual(fourth.recv(1), b"")
+        fourth.close()
+
         player_2.send(
             {
                 "type": "PLAYER_READY",

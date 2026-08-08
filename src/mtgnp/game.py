@@ -1485,11 +1485,17 @@ class GameSession:
             self.priority_holder_seat_id = None
             self._expected_priority_sequence = None
 
-    def visible_state(self, seat_id: str) -> dict[str, Any]:
-        """Return a personalized view that never reveals the opponent's hand."""
+    def visible_state(self, seat_id: str | None) -> dict[str, Any]:
+        """Return a personalized view that never reveals the opponent's hand.
+
+        If seat_id is None, return a spectator view that hides every player's hand.
+        """
 
         with self._lock:
-            viewer = self._player(seat_id)
+            if seat_id is None:
+                viewer = None
+            else:
+                viewer = self._player(seat_id)
             if self.lifecycle_state == LifecycleState.MULLIGAN:
                 phase = LifecycleState.MULLIGAN.value
             elif self.lifecycle_state == LifecycleState.GAME_OVER:
@@ -1513,7 +1519,12 @@ class GameSession:
                     player.player_id: dict(player.mana_pool)
                     for player in self.players.values()
                 },
-                "hand": {viewer.player_id: list(viewer.hand)},
+                "hand": {
+                    player.player_id: []
+                    for player in self.players.values()
+                }
+                if viewer is None
+                else {viewer.player_id: list(viewer.hand)},
                 "hand_counts": {
                     player.player_id: len(player.hand)
                     for player in self.players.values()

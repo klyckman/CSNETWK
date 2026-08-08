@@ -683,8 +683,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Join an MTGNP lobby.")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--player-id", required=True)
-    parser.add_argument("--deck", type=Path, required=True)
+    parser.add_argument(
+        "--spectator",
+        action="store_true",
+        help="Run as a read-only spectator client that receives state only.",
+    )
+    parser.add_argument("--player-id", default=None)
+    parser.add_argument("--deck", type=Path, default=None)
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA_DIRECTORY)
     parser.add_argument(
         "--verbose", action="store_true", help="Print every PDU sent and received."
@@ -1232,18 +1237,32 @@ def _choose_trigger_choice(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
-    try:
+    if args.spectator:
+        if args.player_id is None:
+            args.player_id = "spectator"
         catalog = load_catalog(args.data)
-        deck_list = load_deck_file(args.deck, catalog)
-    except CatalogError as exc:
-        print(f"Deck error: {exc}", file=sys.stderr)
-        return 2
+        deck_list: tuple[str, ...] = ()
+    else:
+        if args.player_id is None or args.deck is None:
+            print(
+                "Player mode requires --player-id and --deck unless --spectator is used.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            catalog = load_catalog(args.data)
+            deck_list = load_deck_file(args.deck, catalog)
+        except CatalogError as exc:
+            print(f"Deck error: {exc}", file=sys.stderr)
+            return 2
 
     client = MTGNPClient(host=args.host, port=args.port, verbose=args.verbose)
     latest_state: dict[str, Any] | None = None
     ready_after_game_over = False
     client.set_heartbeat_resume_renderer(
-        lambda: _render_heartbeat_resume(latest_state, args.player_id)
+        lambda: _render_heartbeat_resume(
+            latest_state, args.player_id if not args.spectator else None
+        )
     )
     try:
         client.connect()
@@ -1251,11 +1270,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             interval_seconds=args.heartbeat_interval,
             timeout_seconds=args.heartbeat_timeout,
         )
-        client.send_ready(args.player_id, deck_list)
-        print(f"Connected to {args.host}:{args.port} as {args.player_id}.")
+        if not args.spectator:
+            client.send_ready(args.player_id, deck_list)
+            print(f"Connected to {args.host}:{args.port} as {args.player_id}.")
+        else:
+            print(f"Connected to {args.host}:{args.port} as spectator.")
         while True:
             pdu = client.receive()
             _render_pdu(pdu)
+            if args.spectator:
+                continue
             if pdu["type"] == MessageType.GAME_OVER.value:
                 ready_after_game_over = True
             if (

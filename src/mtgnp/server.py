@@ -43,6 +43,7 @@ class ClientSession:
     seat_id: str
     address: tuple[str, int]
     connection: FramedConnection
+    role: str
 
 
 @dataclass(slots=True)
@@ -167,11 +168,22 @@ class MTGNPServer:
         self, client_socket: socket.socket, address: tuple[str, int]
     ) -> ClientSession | None:
         with self._sessions_lock:
-            if len(self._sessions) >= 2:
-                return None
-            try:
-                seat_id = self.lobby.connect()
-            except LobbyFull:
+            player_count = sum(
+                1 for session in self._sessions.values() if session.role == "player"
+            )
+            spectator_count = sum(
+                1 for session in self._sessions.values() if session.role == "spectator"
+            )
+            if player_count < 2:
+                try:
+                    seat_id = self.lobby.connect()
+                except LobbyFull:
+                    return None
+                role = "player"
+            elif spectator_count == 0:
+                seat_id = "spectator"
+                role = "spectator"
+            else:
                 return None
             connection = FramedConnection(
                 client_socket,
@@ -179,8 +191,26 @@ class MTGNPServer:
                 tracer=self.tracer,
                 peer_label=f"{seat_id}@{address[0]}:{address[1]}",
             )
-            session = ClientSession(seat_id, address, connection)
+            session = ClientSession(seat_id, address, connection, role=role)
             self._sessions[seat_id] = session
+            if role == "spectator":
+                if self.game is None:
+                    try:
+                        session.connection.send(
+                            {
+                                "type": MessageType.GAME_STATE_UPDATE.value,
+                                "seq_num": self._server_sequence(),
+                                "state": self.lobby.snapshot(),
+                            }
+                        )
+                    except (OSError, ConnectionClosed):
+                        session.connection.close()
+                else:
+                    self._send_personalized_game_state(
+                        session,
+                        self.game,
+                        record_mulligan_token=False,
+                    )
             return session
 
     def _handle_session(self, session: ClientSession) -> None:
@@ -212,6 +242,14 @@ class MTGNPServer:
                     "seq_num": pdu["seq_num"],
                     "timestamp": pdu["timestamp"],
                 }
+            )
+            return
+        if session.role == "spectator":
+            self._send_error(
+                session,
+                ErrorCode.ILLEGAL_ACTION,
+                "Spectator clients may only send PING.",
+                pdu,
             )
             return
         game = self.game
@@ -420,16 +458,20 @@ class MTGNPServer:
         record_discard_token: bool = False,
     ) -> None:
         seq_num = self._server_sequence()
-        if record_mulligan_token:
-            game.record_mulligan_request(session.seat_id, seq_num)
-        if record_discard_token:
-            game.record_discard_request(session.seat_id, seq_num)
+        if session.role != "spectator":
+            if record_mulligan_token:
+                game.record_mulligan_request(session.seat_id, seq_num)
+            if record_discard_token:
+                game.record_discard_request(session.seat_id, seq_num)
+            state = game.visible_state(session.seat_id)
+        else:
+            state = game.visible_state(None)
         try:
             session.connection.send(
                 {
                     "type": MessageType.GAME_STATE_UPDATE.value,
                     "seq_num": seq_num,
-                    "state": game.visible_state(session.seat_id),
+                    "state": state,
                 }
             )
         except (OSError, ConnectionClosed):
@@ -1294,20 +1336,23 @@ class MTGNPServer:
             if self._sessions.get(session.seat_id) is session:
                 del self._sessions[session.seat_id]
                 removed = True
-                with self._game_lock:
-                    if (
-                        self._game is not None
-                        and self._game.lifecycle_state
-                        in {LifecycleState.MULLIGAN, LifecycleState.IN_GAME}
-                    ):
-                        disconnected_game = self._game
-                        self.lobby.disconnect(
-                            session.seat_id, preserve_ready=True
-                        )
-                    else:
-                        self.lobby.disconnect(session.seat_id)
-                        self._game = None
-                        self._trigger_resume = None
+                if session.role == "spectator":
+                    disconnected_game = None
+                else:
+                    with self._game_lock:
+                        if (
+                            self._game is not None
+                            and self._game.lifecycle_state
+                            in {LifecycleState.MULLIGAN, LifecycleState.IN_GAME}
+                        ):
+                            disconnected_game = self._game
+                            self.lobby.disconnect(
+                                session.seat_id, preserve_ready=True
+                            )
+                        else:
+                            self.lobby.disconnect(session.seat_id)
+                            self._game = None
+                            self._trigger_resume = None
         session.connection.close()
         if removed:
             print(f"Disconnected {session.seat_id}")
