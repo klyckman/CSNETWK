@@ -13,7 +13,6 @@ dependencies = []
 [project.scripts]
 mtgnp-server = "mtgnp.server:main"
 mtgnp-client = "mtgnp.client:main"
-mtgnp-gui = "mtgnp.gui_client:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

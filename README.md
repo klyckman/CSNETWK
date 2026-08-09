@@ -18,7 +18,7 @@ bonus GUI path.
 | Resilience | Complete | PING/PONG, priority deadlines, concession, 30-second reconnect grace, repeat games |
 | Submission package | Locally complete | README/PDF, diagrams, AI disclosure, test matrix; LAN and cross-group checks require external participants |
 
-The automated suite currently contains 125 tests and uses only Python's
+The automated suite currently contains 130 tests and uses only Python's
 standard library at runtime.
 
 ## Optional milestone status
@@ -27,8 +27,10 @@ standard library at runtime.
 | --- | --- | --- |
 | O1A. Simple spell families | Complete | Declarative spell rules plus Shock, Lava Spike, Flame Slash, Searing Spear, Cancel, and Negate |
 | O1B. Zones and resources | Complete | Naturalize, Terror, Raise Dead, Rampant Growth, Dark Ritual, and Incinerate |
-| O1C-O1F. Full catalog closure | Planned | Choices, special costs, permanent effects, then a 58-card coverage audit |
-| O2-O4. Creative features and demo | In progress | Tk GUI client, card/help polish, and demo-oriented launch commands |
+| O1C-O1F. Full catalog closure | Cancelled | Choices, special costs, permanent effects, then a 58-card coverage audit |
+| O2. Optional UI polish | Cancelled | Tk GUI client, card/help polish, and demo-oriented launch commands |
+| O3. Spectator client | Complete | Read-only spectator mode with server-authoritative, hidden-information-safe game state, converts third player client to spectator |
+| O4. Bonus demonstration hardening | Cancelled | Planned scripted decks, clean-clone testing, LAN run, and interoperability evidence |
 
 The detailed order, card grouping, and acceptance gates are in
 `docs/OPTIONAL_MILESTONES.md`.
@@ -55,9 +57,8 @@ An editable install is optional:
 python -m pip install -e .
 ```
 
-After an editable install, `mtgnp-server`, `mtgnp-client`, and `mtgnp-gui` may
-be used in place of `python -m mtgnp.server`, `python -m mtgnp.client`, and
-`python -m mtgnp.gui_client`.
+After an editable install, `mtgnp-server` and `mtgnp-client` may be used in
+place of `python -m mtgnp.server` and `python -m mtgnp.client`.
 
 ### Regenerate the submission PDF
 
@@ -99,10 +100,10 @@ Start player 2:
 python -m mtgnp.client --player-id bob --deck decks/stack_demo_blue_black.json --auto-keep --verbose
 ```
 
-For the graphical client, use the same deck and connection arguments:
+Optional spectator client(s):
 
 ```powershell
-mtgnp-gui --player-id alice --deck decks/stack_demo_red_green.json --auto-keep
+python -m mtgnp.client --spectator --host 127.0.0.1 --verbose
 ```
 
 `--verbose` is the required demo mode. It prints every complete PDU sent and
@@ -199,6 +200,7 @@ python -m mtgnp.server --reconnect-grace 30 --verbose
 flowchart LR
     C1["Terminal client: player 1"] <-->|"Framed JSON over TCP"| S["Authoritative MTGNP server"]
     C2["Terminal client: player 2"] <-->|"Framed JSON over TCP"| S
+    CS["Terminal client: spectator"] <-->|"Framed JSON over TCP"| S
     S --> P["Protocol validation and tracing"]
     S --> L["Two-seat lobby and lifecycle"]
     S --> G["Game, Stack, abilities, triggers, combat"]

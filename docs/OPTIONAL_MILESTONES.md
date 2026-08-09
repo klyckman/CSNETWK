@@ -22,13 +22,13 @@ The rubric lists two optional categories:
 | --- | --- | --- | --- |
 | O1A. Simple spell families | Data-driven spell registry; Shock, Lava Spike, Flame Slash, Searing Spear, Cancel, and Negate | Correct targets, timing, mana, Stack resolution, fizzle, protection, and atomic rejection tests | Implemented |
 | O1B. Zones and resources | Naturalize, Terror, Raise Dead, Rampant Growth, Dark Ritual, and Incinerate's regeneration restriction | Zone changes and mana changes are authoritative, visible, reversible only where rules allow, and tested over the network | Implemented |
-| O1C. Choices and conditional resolution | Ponder, Mana Leak, Swords to Plowshares, Path to Exile, Healing Salve, and Mind Rot | Server-issued choices cannot leak hidden information; decline/pay/invalid-choice branches are tested | Planned |
-| O1D. Additional and alternative costs | Kicker for Goblin Bushwhacker and Vines of Vastwood, Madness for Reckless Wurm, Suspend for Rift Bolt | Costs and timing are declared in protocol-compatible fields and remain atomic | Planned |
-| O1E. Permanent and turn-wide rules | Merfolk Looter, Llanowar Elves, Elvish Mystic, Sol Ring, Troll Ascetic, Mother of Runes, Pacifism, Skullcrack, regeneration, and trample | Activated/static/continuous effects survive state updates and interact correctly with combat, targeting, and Cleanup | Planned |
-| O1F. Full-catalog closure | Audit all 58 definitions and 312 instances, including vanilla creatures, lands, and existing keywords/triggers | Every definition is classified as fully implemented; automated coverage matrix has no unsupported effect | Planned |
-| O2. Optional UI polish | Card-name/effect help, clearer choice prompts, supported-card view, and demonstration scripts | A new player can complete the demonstration without knowing instance IDs in advance | In progress |
-| O3. One creative client extension | Choose a read-only spectator/replay client or a graphical player client | Feature uses the authoritative server, reveals no hidden information, and is demonstrable on two machines | In progress |
-| O4. Bonus demonstration hardening | Scripted decks, feature checklist, clean-clone test, LAN run, and recorded interoperability evidence | Every claimed bonus can be reproduced and explained during checking | In progress |
+| O1C. Choices and conditional resolution | Ponder, Mana Leak, Swords to Plowshares, Path to Exile, Healing Salve, and Mind Rot | Server-issued choices cannot leak hidden information; decline/pay/invalid-choice branches are tested | Cancelled |
+| O1D. Additional and alternative costs | Kicker for Goblin Bushwhacker and Vines of Vastwood, Madness for Reckless Wurm, Suspend for Rift Bolt | Costs and timing are declared in protocol-compatible fields and remain atomic | Cancelled |
+| O1E. Permanent and turn-wide rules | Merfolk Looter, Llanowar Elves, Elvish Mystic, Sol Ring, Troll Ascetic, Mother of Runes, Pacifism, Skullcrack, regeneration, and trample | Activated/static/continuous effects survive state updates and interact correctly with combat, targeting, and Cleanup | Cancelled |
+| O1F. Full-catalog closure | Audit all 58 definitions and 312 instances, including vanilla creatures, lands, and existing keywords/triggers | Every definition is classified as fully implemented; automated coverage matrix has no unsupported effect | Cancelled |
+| O2. Optional UI polish | Card-name/effect help, clearer choice prompts, supported-card view, and demonstration scripts | A new player can complete the demonstration without knowing instance IDs in advance | Cancelled |
+| O3. One creative client extension | Read-only spectator client for observing an active MTGNP game | Feature uses the authoritative server, reveals no hidden information, and is demonstrable on two machines | Implemented |
+| O4. Bonus demonstration hardening | Scripted decks, feature checklist, clean-clone test, LAN run, and recorded interoperability evidence | Every claimed bonus can be reproduced and explained during checking | Cancelled |
 
 ## O1A implementation record
 
@@ -76,21 +76,23 @@ visible to players. Focused regression tests cover each of these behaviors.
 
 ## O3 implementation record
 
-O3 adds a read-only spectator client for observing an active MTGNP game. The
-spectator client connects to the authoritative server without occupying a player
-seat and receives the same shared game information available to spectators.
+O3 adds a read-only spectator mode to the MTGNP client. Additional connections
+beyond the two-player limit are accepted as spectators without occupying a 
+player seat.
 
-The client renders the current lobby or game state, including the battlefield,
-visible cards, life totals, mana information, turn and phase, Stack activity,
-combat events, trigger activity, and game-over results. It updates its display
-from server-issued state and protocol messages rather than implementing or
-resolving game rules locally.
+Spectators receive a server-generated view of the game state that hides all
+players' hands while showing public information such as the battlefield, life
+totals, mana, turn, phase, and Stack activity. Furthermore, spectators cannot
+send game actions as the server only permits `PING` messages from the spectator
+client.
 
-The spectator client is strictly read-only. It does not send game actions, 
-make player choices, receive hidden player information, or modify the game state.
-The server explicitly assigns the spectator role and rejects non-PING messages
-from spectator clients, preserving the server-authoritative architecture and
-preventing spectators from affecting an ongoing match.
+A limitation to this implementation is that spectator status depends on
+server-side seat availability. The server determines whether a connection is a
+player or spectator based on the number of occupied player seats rather than
+solely on the client's `--spectator` flag. As a result, spectator clients
+connecting before two players ware present may be assigned player seats, since
+the server assigns the first two connections as players. Spectator status is
+guaranteed once the two player seats are occupied.
 
 ## Rules for every later optional slice
 

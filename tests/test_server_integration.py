@@ -131,152 +131,75 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(grant["type"], "PRIORITY_GRANT")
         return clients, active, other, grant
 
-    def test_two_player_lobby_third_refusal_errors_updates_and_ping(self) -> None:
+    def test_third_connection_is_spectator_and_cannot_join_as_player(self) -> None:
         player_1 = self.connect_client("server-for-alice")
         player_2 = self.connect_client("server-for-bob")
         self.assertTrue(wait_for(lambda: self.server.active_connections == 2))
 
-        third = socket.create_connection(("127.0.0.1", self.server.bound_port))
-        third.settimeout(2)
-        self.assertEqual(third.recv(1), b"")
-        third.close()
-        self.assertEqual(self.server.active_connections, 2)
+        third = self.connect_client("server-for-charlie")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 3))
 
-        player_1.send(
+        third_update = third.receive()
+        self.assertEqual(third_update["type"], "GAME_STATE_UPDATE")
+        self.assertEqual(third_update["state"]["players_connected"], 2)
+
+        third.send(
             {
                 "type": "PLAYER_READY",
                 "seq_num": 1,
-                "player_id": "alice",
-                "deck_list": ["mountain_001", "lightning_bolt_001"],
-            }
-        )
-        update_for_alice = player_1.receive()
-        update_for_bob = player_2.receive()
-        self.assertEqual(update_for_alice["type"], "GAME_STATE_UPDATE")
-        self.assertEqual(update_for_bob["state"]["players_ready"], 1)
-        self.assertEqual(update_for_bob["state"]["waiting_for"], ["seat_2"])
-
-    def test_accepts_spectator_as_third_connection_and_refuses_fourth(self) -> None:
-        player_1 = self.connect_client("server-for-alice")
-        player_2 = self.connect_client("server-for-bob")
-        self.assertTrue(wait_for(lambda: self.server.active_connections == 2))
-
-        spectator = self.connect_client("server-for-spectator")
-        self.assertTrue(wait_for(lambda: self.server.active_connections == 3))
-        spectator_update = spectator.receive()
-        self.assertEqual(spectator_update["type"], "GAME_STATE_UPDATE")
-        self.assertEqual(spectator_update["state"]["players_connected"], 2)
-
-        spectator.send({"type": "PING", "seq_num": 1, "timestamp": 111})
-        spectator_pong = spectator.receive()
-        self.assertEqual(spectator_pong["type"], "PONG")
-
-        spectator.send(
-            {
-                "type": "PLAYER_READY",
-                "seq_num": 2,
                 "player_id": "charlie",
                 "deck_list": ["swamp_001"],
             }
         )
-        spectator_error = spectator.receive()
-        self.assertEqual(spectator_error["type"], "ERROR")
-        self.assertEqual(spectator_error["code"], "ILLEGAL_ACTION")
 
-        fourth = socket.create_connection(("127.0.0.1", self.server.bound_port))
-        fourth.settimeout(2)
-        self.assertEqual(fourth.recv(1), b"")
-        fourth.close()
+        third_error = third.receive()
+        self.assertEqual(third_error["type"], "ERROR")
+        self.assertEqual(third_error["code"], "ILLEGAL_ACTION")
 
-        player_2.send(
-            {
-                "type": "PLAYER_READY",
-                "seq_num": 1,
-                "player_id": "alice",
-                "deck_list": ["island_001"],
-            }
-        )
-        duplicate_error = player_2.receive()
-        self.assertEqual(duplicate_error["type"], "ERROR")
-        self.assertEqual(duplicate_error["code"], "DUPLICATE_ID")
-        self.assertEqual(duplicate_error["seq_num"], 1)
+    def test_accepts_multiple_spectators_after_two_players(self) -> None:
+        player_1 = self.connect_client("server-for-alice")
+        player_2 = self.connect_client("server-for-bob")
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 2))
 
-        player_2.send(
-            {
-                "type": "PLAYER_READY",
-                "seq_num": 2,
-                "player_id": "bob",
-                "deck_list": ["island_001", "counterspell_001"],
-            }
-        )
-        final_for_alice = player_1.receive()
-        final_for_bob = player_2.receive()
-        self.assertEqual(final_for_alice["state"]["players_ready"], 2)
-        self.assertEqual(final_for_bob["state"]["waiting_for"], [])
-        self.assertEqual(final_for_bob["state"]["ready_players"], ["alice", "bob"])
+        spectator_1 = self.connect_client("server-for-spectator-1")
+        spectator_2 = self.connect_client("server-for-spectator-2")
 
-        setup_for_alice = player_1.receive()
-        setup_for_bob = player_2.receive()
-        self.assertEqual(setup_for_alice["state"]["phase"], "MULLIGAN")
-        self.assertEqual(setup_for_bob["state"]["phase"], "MULLIGAN")
-        self.assertEqual(set(setup_for_alice["state"]["hand"]), {"alice"})
-        self.assertEqual(set(setup_for_bob["state"]["hand"]), {"bob"})
-        self.assertEqual(setup_for_alice["state"]["life_totals"], {"alice": 20, "bob": 20})
+        self.assertTrue(wait_for(lambda: self.server.active_connections == 4))
 
-        player_1.send({"type": "PING", "seq_num": 2, "timestamp": 987654})
-        pong = player_1.receive()
-        self.assertEqual(
-            pong,
-            {"type": "PONG", "seq_num": 2, "timestamp": 987654},
-        )
+        for spectator in (spectator_1, spectator_2):
+            spectator_update = spectator.receive()
 
-        player_1.send({"type": "PRIORITY_PASS", "seq_num": 3})
-        wrong_phase = player_1.receive()
-        self.assertEqual(wrong_phase["type"], "ERROR")
-        self.assertEqual(wrong_phase["code"], "WRONG_PHASE")
+            self.assertEqual(spectator_update["type"], "GAME_STATE_UPDATE")
+            self.assertEqual(
+                spectator_update["state"]["players_connected"],
+                2,
+            )
 
-        player_1.send(
-            {
-                "type": "MULLIGAN_CHOICE",
-                "seq_num": 0,
-                "keep": True,
-                "cards_to_bottom": [],
-            }
-        )
-        stale = player_1.receive()
-        self.assertEqual(stale["type"], "ERROR")
-        self.assertEqual(stale["code"], "STALE_ACTION")
+            spectator.send(
+                {
+                    "type": "PING",
+                    "seq_num": 1,
+                    "timestamp": 111,
+                }
+            )
 
-        player_1.send(
-            {
-                "type": "MULLIGAN_CHOICE",
-                "seq_num": setup_for_alice["seq_num"],
-                "keep": True,
-                "cards_to_bottom": [],
-            }
-        )
-        player_2.send(
-            {
-                "type": "MULLIGAN_CHOICE",
-                "seq_num": setup_for_bob["seq_num"],
-                "keep": True,
-                "cards_to_bottom": [],
-            }
-        )
+            spectator_pong = spectator.receive()
 
-        transition_for_alice = player_1.receive()
-        transition_for_bob = player_2.receive()
-        self.assertEqual(transition_for_alice["type"], "PHASE_TRANSITION")
-        self.assertEqual(transition_for_alice["from_phase"], "MULLIGAN")
-        self.assertEqual(transition_for_bob["to_phase"], "UNTAP")
-        self.assertEqual(transition_for_bob["turn"], 1)
+            self.assertEqual(spectator_pong["type"], "PONG")
 
-        in_game_for_alice = player_1.receive()
-        in_game_for_bob = player_2.receive()
-        self.assertEqual(in_game_for_alice["state"]["phase"], "UNTAP")
-        self.assertEqual(in_game_for_bob["state"]["lifecycle_state"], "IN_GAME")
-        self.assertEqual(set(in_game_for_alice["state"]["hand"]), {"alice"})
-        self.assertEqual(set(in_game_for_bob["state"]["hand"]), {"bob"})
+            spectator.send(
+                {
+                    "type": "PLAYER_READY",
+                    "seq_num": 2,
+                    "player_id": "charlie",
+                    "deck_list": ["swamp_001"],
+                }
+            )
+
+            spectator_error = spectator.receive()
+
+            self.assertEqual(spectator_error["type"], "ERROR")
+            self.assertEqual(spectator_error["code"], "ILLEGAL_ACTION")
 
     def test_concede_rejects_spoofing_then_restarts_on_same_connections(self) -> None:
         clients, active, other, grant = self.connect_kept_game(

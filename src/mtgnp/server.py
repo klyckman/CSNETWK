@@ -180,11 +180,9 @@ class MTGNPServer:
                 except LobbyFull:
                     return None
                 role = "player"
-            elif spectator_count == 0:
-                seat_id = "spectator"
-                role = "spectator"
             else:
-                return None
+                seat_id = f"spectator-{spectator_count + 1}"
+                role = "spectator"
             connection = FramedConnection(
                 client_socket,
                 local_sender=Sender.SERVER,
