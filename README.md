@@ -1,46 +1,10 @@
 # MTGNP
 
-MTGNP is a two-player, server-authoritative implementation of the Magic: The
-Gathering Multiplayer Network Protocol v1.0 for CSNETWK. The required base
-protocol and gameplay milestones are implemented. Optional full-card-effect
-coverage is now in progress, and a Tk graphical client is available for the
-bonus GUI path.
-
-## Base milestone status
-
-| Area | Status | Evidence |
-| --- | --- | --- |
-| Protocol and framing | Complete | All 25 PDU types, four-byte big-endian frames, 65,535-byte limit, sender validation |
-| Lobby and setup | Complete | Two seats, deck validation, hidden hands, random first player, London mulligan |
-| Turn engine | Complete | Every phase/step, Draw Step, priority, Cleanup, restart |
-| Mana, spells, and Stack | Complete | Land limits, inferred mana payment, LIFO resolution, state-based actions, more than five effects |
-| Combat | Complete | Attackers, blockers, order, first strike, simultaneous damage, summoning sickness |
-| Resilience | Complete | PING/PONG, priority deadlines, concession, 30-second reconnect grace, repeat games |
-| Submission package | Locally complete | README/PDF, diagrams, AI disclosure, test matrix; LAN and cross-group checks require external participants |
-
-The automated suite currently contains 130 tests and uses only Python's
-standard library at runtime.
-
-## Optional milestone status
-
-| Milestone | Status | Result |
-| --- | --- | --- |
-| O1A. Simple spell families | Complete | Declarative spell rules plus Shock, Lava Spike, Flame Slash, Searing Spear, Cancel, and Negate |
-| O1B. Zones and resources | Complete | Naturalize, Terror, Raise Dead, Rampant Growth, Dark Ritual, and Incinerate |
-| O1C-O1F. Full catalog closure | Cancelled | Choices, special costs, permanent effects, then a 58-card coverage audit |
-| O2. Optional UI polish | Cancelled | Tk GUI client, card/help polish, and demo-oriented launch commands |
-| O3. Spectator client | Complete | Read-only spectator mode with server-authoritative, hidden-information-safe game state, converts third player client to spectator |
-| O4. Bonus demonstration hardening | Cancelled | Planned scripted decks, clean-clone testing, LAN run, and interoperability evidence |
-
-The detailed order, card grouping, and acceptance gates are in
-`docs/OPTIONAL_MILESTONES.md`.
-
-## Requirements
-
-- Python 3.11 or newer
-- Two terminal windows for clients and one for the server
-- TCP port 4444 reachable between the machines for a LAN game
-- No third-party runtime packages
+MTGNP is a terminal-based, two-player game of Magic: The Gathering played over
+a TCP network. Both players connect to an authoritative server that manages
+decks, hidden hands, turns, mana, spells, the Stack, combat, win conditions,
+reconnection, and repeat games. A read-only spectator can follow the match
+without seeing either player's private hand.
 
 ## Build and test
 
@@ -106,6 +70,11 @@ Optional spectator client(s):
 python -m mtgnp.client --spectator --host 127.0.0.1 --verbose
 ```
 
+The server always reserves exactly two player seats. After those seats are
+occupied, additional connections receive a spectator role rather than a third
+player seat. A spectator receives sanitized authoritative state, may send
+`PING`, and receives `ILLEGAL_ACTION` for gameplay PDUs.
+
 `--verbose` is the required demo mode. It prints every complete PDU sent and
 received with direction, peer, type, sequence number, timestamp, and formatted
 JSON. PING and PONG retain every field but use one compact line each. During
@@ -170,6 +139,12 @@ for damage order when several creatures block one attacker.
   `Available mana` line counts currently untapped mana sources.
 - Both players must pass consecutively to resolve the top Stack item or advance
   an empty priority window.
+- The client sends `PING` every 30 seconds and waits up to 10 seconds for the
+  matching `PONG`. This timeout applies to heartbeat replies, not to a turn or
+  phase. A priority grant has its own 60-second action deadline.
+- Goblin Guide and Monastery Swiftspear have haste in the fixed catalog, so
+  they may attack on the turn they enter. The catalog and normative rules take
+  precedence over any contradictory walkthrough example.
 
 ## Disconnect and reconnect
 
@@ -227,7 +202,8 @@ The base rubric requires at least five effects. The implementation exceeds
 that gate with spell effects, activated abilities, and triggered abilities.
 
 - Spells: Lightning Bolt, Shock, Lava Spike, Flame Slash, Searing Spear,
-  Unsummon, Counterspell, Cancel, Negate, Giant Growth, Doom Blade
+  Unsummon, Counterspell, Cancel, Negate, Giant Growth, Doom Blade, Naturalize,
+  Terror, Raise Dead, Rampant Growth, Dark Ritual, Incinerate
 - Activated abilities: Prodigal Sorcerer, Royal Assassin, Millstone, Rod of Ruin
 - Triggered abilities: Goblin Guide, Monastery Swiftspear, Phantasmal Bear,
   Gray Merchant of Asphodel, Gravedigger
@@ -265,43 +241,63 @@ advance.
   increasing server sequence number, including separate broadcast copies. The
   explicit Section 11 exception reissues the current token unchanged after a
   rejected action while that player still holds priority.
-- Eleven spell effects and selected activated/triggered abilities are
+- Seventeen spell effects and selected activated/triggered abilities are
   supported. Full behavior for every catalog card is optional bonus work and
-  is being added through the O1 milestone sequence.
-- The required client is terminal-based. A graphical interface is optional.
+  is not claimed because O1C-O1F were cancelled.
+- Exactly two connections receive player seats. Further connections become
+  read-only spectators. This optional O3 extension interprets the base rule
+  about refusing additional connections as refusing additional *players*;
+  graders who require every third TCP connection to be closed should note this
+  intentional deviation.
+- The player and spectator clients are terminal-based. A graphical interface
+  was cancelled and is not part of the submission.
 
 ## Work Distribution Matrix
 
-Replace the member headings and every `Record actual contribution` cell before
-submission. Do not claim work that a member did not perform.
+The group reports an equal contribution model. All three members shared design,
+implementation, review, debugging, gameplay testing, and demo preparation.
+The matrix records that shared ownership; commit counts alone are not treated
+as a measure of contribution.
 
-| Task / Feature | Member 1 | Member 2 | Member 3 | Member 4 |
-| --- | --- | --- | --- | --- |
-| TCP server, connections, framing, dispatch | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| Lobby, setup, and mulligan | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| Turn and phase engine | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| Priority, Stack, spells, and abilities | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| Combat system | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| Client and state rendering | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| All 25 PDU types | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| Errors, heartbeat, timeout, and reconnect | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| Verbose PDU tracing | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| Tests and interoperability | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
-| README, diagrams, and disclosure | Record actual contribution | Record actual contribution | Record actual contribution | Record actual contribution |
+| Task / Feature | King Mejia | Jose Honrado | Walt Hutchison |
+| --- | --- | --- | --- |
+| TCP Server: connection handling, framing, dispatch | Equal contribution | Equal contribution | Equal contribution |
+| Game lifecycle: LOBBY, GAME_SETUP, MULLIGAN logic | Equal contribution | Equal contribution | Equal contribution |
+| Turn & phase engine (all phases/steps, transitions) | Equal contribution | Equal contribution | Equal contribution |
+| Priority & Stack logic, spell/ability resolution | Equal contribution | Equal contribution | Equal contribution |
+| Combat system (attackers, blockers, damage) | Equal contribution | Equal contribution | Equal contribution |
+| Client implementation & state rendering | Equal contribution | Equal contribution | Equal contribution |
+| PDU serialisation/deserialisation (all 25 PDU types) | Equal contribution | Equal contribution | Equal contribution |
+| Error handling, PING/PONG heartbeat, disconnect logic | Equal contribution | Equal contribution | Equal contribution |
+| Verbose mode (client + server PDU logging, toggle on/off) | Equal contribution | Equal contribution | Equal contribution |
+| Testing & interoperability | Equal contribution | Equal contribution | Equal contribution |
+| README / documentation / AI disclosure | Equal contribution | Equal contribution | Equal contribution |
 
 ## AI Usage
 
-OpenAI Codex was used as a learning and development assistant to analyze the
-provided MTGNP specification and CSV catalog, propose milestone boundaries,
-explain MTG rules and protocol behavior, draft and revise Python implementation
-code, create automated tests, improve terminal readability, diagnose gameplay
-issues, and prepare documentation. Its output was applied to the local project
-through an iterative workflow and checked with the automated test suite.
+The project used the following AI tools:
 
-Before submission, every group member must personally review the implementation,
-run the tests, perform the manual interoperability checks, and be able to
-explain the generated or assisted code. Update this disclosure if any other AI
-tool is used.
+- **OpenAI Codex:** analyzed the MTGNP specification, rubric, and CSV catalog;
+  reviewed the implementation against the rubric; explained rules, priority,
+  heartbeat, and branch-integration behavior; helped draft and revise Python
+  code and automated tests; improved compact verbose heartbeat output and
+  prompt restoration; diagnosed gameplay issues; and prepared submission and
+  demo documentation.
+- **Anthropic Claude:** helped draft and refine the video-demo script so the
+  required rubric evidence could fit within the eight-minute limit, and
+  assisted with selected optional-milestone implementation and review work.
+
+AI output was not accepted blindly. The group reviewed the changes, performed
+gameplay tests, ran the automated suite, and retained responsibility for the
+implementation and submission. No other AI tool is reported as used.
+
+## Dependencies and project tools
+
+- The game runtime uses only the Python standard library.
+- ReportLab is used only by `scripts/build_readme_pdf.py` to produce the
+  submission PDF; it is not required to run the game.
+- Git and GitHub are used for version control, branch integration, and group
+  collaboration.
 
 ## Project documentation
 
@@ -314,7 +310,6 @@ tool is used.
 - `docs/COMBAT_DESIGN.md` - combat validation and damage
 - `docs/ACTIVATED_ABILITIES_DESIGN.md` - activated-ability registry and flow
 - `docs/TRIGGERED_ABILITIES_DESIGN.md` - triggers, choices, and APNAP ordering
-- `docs/OPTIONAL_MILESTONES.md` - ordered bonus roadmap and full-card-effect slices
 - `docs/RESILIENCE_DESIGN.md` - timeout, heartbeat, concession, and reconnect
 - `docs/ARCHITECTURE_AND_DEMO.md` - component and sequence walkthrough
 - `docs/INTEROPERABILITY_TEST_MATRIX.md` - required external test record

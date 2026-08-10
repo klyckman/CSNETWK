@@ -252,7 +252,7 @@ def _parse_markdown(markdown: str) -> list[object]:
             continue
         if stripped.startswith("## "):
             heading = stripped[3:]
-            if heading == "AI Usage":
+            if heading in {"Work Distribution Matrix", "AI Usage"}:
                 story.append(PageBreak())
             story.append(Paragraph(_inline_markup(heading), STYLES["h2"]))
             index += 1
