@@ -153,13 +153,31 @@ STYLES = _styles()
 
 
 def _inline_markup(text: str) -> str:
-    escaped = html.escape(text.strip())
+    links: dict[str, str] = {}
+
+    def replace_link(match: re.Match[str]) -> str:
+        token = f"LINKPLACEHOLDER{len(links)}END"
+        label = html.escape(match.group(1))
+        url = html.escape(match.group(2), quote=True)
+        links[token] = (
+            f'<link href="{url}" color="#1D4ED8"><u>{label}</u></link>'
+        )
+        return token
+
+    with_link_tokens = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        replace_link,
+        text.strip(),
+    )
+    escaped = html.escape(with_link_tokens)
     escaped = re.sub(
         r"`([^`]+)`",
         lambda match: f'<font name="{MONO_FONT}">{match.group(1)}</font>',
         escaped,
     )
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
+    for token, markup in links.items():
+        escaped = escaped.replace(token, markup)
     return escaped
 
 

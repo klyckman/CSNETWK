@@ -6,6 +6,10 @@ decks, hidden hands, turns, mana, spells, the Stack, combat, win conditions,
 reconnection, and repeat games. A read-only spectator can follow the match
 without seeing either player's private hand.
 
+## Demo Video
+
+[Watch the MTGNP demo video on Google Drive](https://drive.google.com/file/d/1pk8WK4YVdOSh5IGX2owpp9axPIXT0f_D/view?usp=sharing)
+
 ## Build and test
 
 Open PowerShell in the `MTGNP` directory:
